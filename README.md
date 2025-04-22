@@ -8,7 +8,7 @@ First, install the package in development mode:
 
 ```bash
 git clone https://github.com/evanyfyang/PFN-TSP.git
-cd PFNs
+cd PFN-TSP
 pip install -e .
 ```
 
