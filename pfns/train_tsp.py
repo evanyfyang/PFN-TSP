@@ -11,6 +11,7 @@ import typing as tp
 import torch
 from torch import nn
 from torch.amp import autocast, GradScaler
+import torch.nn.functional as F
 
 from . import utils
 from .priors import prior
@@ -19,8 +20,69 @@ from .transformer import TransformerModel
 from .bar_distribution import BarDistribution, FullSupportBarDistribution, get_bucket_limits, get_custom_bar_dist
 from .utils import get_cosine_schedule_with_warmup, get_openai_lr, StoreDictKeyPair, get_weighted_single_eval_pos_sampler, get_uniform_single_eval_pos_sampler
 from . import positional_encodings
-from .utils import init_dist
+from .utils import init_dist, bool_mask_to_att_mask
+from .priors.tsp_data_loader import TSPDataLoader
+from .priors.tsp_encoder import tsp_graph_encoder_generator, tsp_tour_encoder_generator
 
+class TSPAttentionCriterion(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.bce = nn.BCEWithLogitsLoss(reduction='none')
+
+    def forward(self, output, targets, edge_info):
+        edge_index, node_offset_map = edge_info
+        seq_len, batch_size, _ = targets.shape
+        
+        edge_index = edge_index.cpu().tolist()
+        
+        reversed_node_map = {value: key for key, value in node_offset_map.items()}
+        
+        edge_mask = torch.zeros_like(output)
+        edge_labels = torch.zeros_like(output)
+        flattened_edges = []
+        flattened_positions = []
+        
+        for i in range(seq_len):
+            for j in range(batch_size):
+                edges = edge_index[i][j]
+                for e_idx, edge in enumerate(edges):
+                    node0 = reversed_node_map[edge[0]][-1]
+                    node1 = reversed_node_map[edge[1]][-1]
+                    
+                    if node0 > node1:
+                        continue
+                    
+                    flattened_edges.append((node0, node1))
+                    flattened_positions.append((i, j, e_idx))
+        
+        tours = targets.cpu()
+        tour_edges = {}
+        
+        for i in range(seq_len):
+            for j in range(batch_size):
+                tour = tours[i, j]
+                tour_len = tour.shape[0]
+                tour_edge_set = set()
+                for k in range(tour_len):
+                    n1, n2 = tour[k].item(), tour[(k + 1) % tour_len].item()
+                    if n1 > n2:
+                        n1, n2 = n2, n1
+                    tour_edge_set.add((n1, n2))
+                tour_edges[(i, j)] = tour_edge_set
+        
+        for (node0, node1), (i, j, e_idx) in zip(flattened_edges, flattened_positions):
+            edge_mask[i, j, e_idx] = 1
+            edge_is_in_tour = (node0, node1) in tour_edges[(i, j)]
+            edge_labels[i, j, e_idx] = 1.0 if edge_is_in_tour else 0.0
+        
+        weights = torch.ones_like(edge_labels)
+        weights[edge_labels == 0] = 0.1
+        weights[edge_mask == 0] = 0.0
+        
+        losses = (self.bce(output, edge_labels) * weights).sum(dim=-1)
+        
+        return losses
+        
 class Losses():
     gaussian = nn.GaussianNLLLoss(full=True, reduction='none')
     mse = nn.MSELoss(reduction='none')
@@ -65,6 +127,7 @@ def train(priordataloader_class_or_get_batch: prior.PriorDataLoader | callable, 
                                eval_pos_seq_len_sampler=eval_pos_seq_len_sampler,
                                seq_len_maximum=seq_len,
                                device=device,
+                               num_processes=32,
                                **extra_prior_kwargs_dict)
 
     test_batch: prior.Batch = dl.get_test_batch()
@@ -181,61 +244,17 @@ def train(priordataloader_class_or_get_batch: prior.PriorDataLoader | callable, 
                 try:
                     metrics_to_log = {}
                     with autocast(device.split(':')[0], enabled=scaler is not None):
-                        # If style is set to None, it should not be transferred to device
-                        out = model(tuple(e.to(device) if torch.is_tensor(e) else e for e in data),
+                        output, edge_info = model(tuple(e.to(device) if torch.is_tensor(e) else e for e in data),
                                     single_eval_pos=single_eval_pos, only_return_standard_out=False)
-
-                        # this handling is for training old models only, this can be deleted soon(ish)
-                        # to only support models that return a tuple of dicts
-                        out, output_once = out if isinstance(out, tuple) else (out, None)
-                        output = out['standard'] if isinstance(out, dict) else out
-
+                        
                         forward_time = time.time() - before_forward
 
                         if single_eval_pos is not None:
                             targets = targets[single_eval_pos:]
 
-                        if len(targets.shape) == len(output.shape):
-                            # this implies the prior uses a trailing 1 dimesnion
-                            # below we assume this not to be the case
-                            targets = targets.squeeze(-1)
-                        assert targets.shape == output.shape[:-1], f"Target shape {targets.shape} " \
-                                                                   "does not match output shape {output.shape}"
-                        if isinstance(criterion, nn.GaussianNLLLoss):
-                            assert output.shape[-1] == 2, \
-                                'need to write a little bit of code to handle multiple regression targets at once'
-
-                            mean_pred = output[..., 0]
-                            var_pred = output[..., 1].abs()
-                            losses = criterion(mean_pred.flatten(), targets.flatten(), var=var_pred.flatten())
-                        elif isinstance(criterion, (nn.MSELoss, nn.BCEWithLogitsLoss)):
-                            targets[torch.isnan(targets)] = -100
-                            losses = criterion(output.flatten(), targets.flatten())
-                        elif isinstance(criterion, nn.CrossEntropyLoss):
-                            targets[torch.isnan(targets)] = -100
-                            losses = criterion(output.reshape(-1, n_out), targets.long().flatten())
-                        elif border_decoder is not None:
-                            def apply_batch_wise_criterion(i):
-                                output_, targets_, borders_ = output_adaptive[:, i], targets[:, i], borders[i]
-                                criterion_ = get_custom_bar_dist(borders_, criterion).to(device)
-                                return criterion_(output_, targets_)
-                            output_adaptive, borders = out['adaptive_bar'], output_once['borders']
-                            losses_adaptive_bar = torch.stack([apply_batch_wise_criterion(i) for i in range(output_adaptive.shape[1])], 1)
-                            losses_fixed_bar = criterion(output, targets)
-                            losses = (losses_adaptive_bar + losses_fixed_bar) / 2
-
-                            metrics_to_log = {**metrics_to_log,
-                                              **{'loss_fixed_bar': losses_fixed_bar.mean().cpu().detach().item(),
-                                                 'loss_adaptive_bar': losses_adaptive_bar.mean().cpu().detach().item()}}
-                        elif isinstance(criterion, BarDistribution) and full_data.mean_prediction:
-                            assert 'mean_prediction' in output_once
-                            utils.print_once('Using mean prediction for loss')
-                            losses = criterion(output, targets, mean_prediction_logits=output_once['mean_prediction'])
-                            # the mean pred loss appears as the last per sequence
-                        else:
-                            losses = criterion(output, targets)
-                        losses = losses.view(-1, output.shape[1]) # sometimes the seq length can be one off
-                                                                  # that is because bar dist appends the mean
+                        losses = criterion(output, targets, edge_info)
+                        losses = losses.view(-1, output.shape[1]) 
+                                                                  
                         loss, nan_share = utils.torch_nanmean(losses.mean(0), return_nanshare=True)
                         loss_scaled = loss / aggregate_k_gradients
 
@@ -341,3 +360,82 @@ def _parse_args(config_parser, parser):
     # Cache the args as a text string to save them in the output dir later
     args_text = yaml.safe_dump(args.__dict__, default_flow_style=False)
     return args, args_text
+
+def train_tsp(
+    emsize=200, 
+    nhid=200, 
+    nlayers=6, 
+    nhead=2, 
+    dropout=0.0,
+    epochs=10, 
+    steps_per_epoch=100, 
+    batch_size=32, 
+    seq_len=20, 
+    lr=None, 
+    weight_decay=0.0, 
+    warmup_epochs=2,
+    num_nodes_range=(10, 20),
+    gpu_device=None,
+    **extra_args
+):
+    """
+    Train a Transformer model for TSP instances using GNN for node encoding.
+    Uses the original train() function with custom encoders and loss function.
+    
+    Args:
+        emsize: Embedding size
+        nhid: Hidden dimension in transformer
+        nlayers: Number of transformer layers
+        nhead: Number of attention heads
+        dropout: Dropout rate
+        epochs: Number of training epochs
+        steps_per_epoch: Number of steps per epoch
+        batch_size: Batch size
+        seq_len: Maximum sequence length
+        lr: Learning rate (if None, uses OpenAI schedule)
+        weight_decay: Weight decay for optimizer
+        warmup_epochs: Number of warmup epochs for learning rate
+        num_nodes_range: Range of nodes in TSP instances (min, max)
+        gpu_device: Device to use for computation (defaults to cuda if available)
+        **extra_args: Additional arguments for train function
+        
+    Returns:
+        TrainingResult object
+    """
+    device = gpu_device if gpu_device else ('cuda:0' if torch.cuda.is_available() else 'cpu')
+    print(f"Training TSP model on {device} with {emsize} embedding size")
+    
+    # Create single_eval_pos sampler
+    single_eval_pos_sampler = get_uniform_single_eval_pos_sampler(seq_len, min_len=3)
+    
+    # Create custom loss for BMM with edge attention
+    
+        
+    # Create the custom TSP criterion
+    tsp_criterion = TSPAttentionCriterion()
+    
+    # Use train() function with the custom components
+    result = train(
+        priordataloader_class_or_get_batch=TSPDataLoader,
+        criterion=tsp_criterion,
+        encoder_generator=tsp_graph_encoder_generator,
+        y_encoder_generator=lambda num_features, emsize: tsp_tour_encoder_generator(num_features, emsize, max_nodes=max(num_nodes_range)),
+        emsize=emsize,
+        nhid=nhid,
+        nlayers=nlayers,
+        nhead=nhead,
+        dropout=dropout,
+        epochs=epochs,
+        steps_per_epoch=steps_per_epoch,
+        batch_size=batch_size,
+        seq_len=seq_len,
+        lr=lr,
+        weight_decay=weight_decay,
+        warmup_epochs=warmup_epochs,
+        extra_prior_kwargs_dict={'num_nodes_range': num_nodes_range},
+        single_eval_pos_gen=single_eval_pos_sampler,
+        gpu_device=device,
+        **extra_args
+    )
+    
+    return result

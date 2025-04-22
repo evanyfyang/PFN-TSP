@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 from torch.nn import Module, TransformerEncoder
-
+import torch.nn.functional as F
 from .layer import TransformerEncoderLayer, _get_activation_fn
 from .utils import SeqBN, bool_mask_to_att_mask
 
@@ -59,6 +59,8 @@ class TransformerModel(nn.Module):
         self.efficient_eval_masking = efficient_eval_masking
 
         self.nhid = nhid
+
+        self.edge_mlp = nn.Sequential(nn.Linear(nhid, nhid), nn.GELU())
 
         self.init_weights()
 
@@ -165,53 +167,75 @@ class TransformerModel(nn.Module):
         if single_eval_pos is None:
             single_eval_pos = x_src.shape[0]
 
-
-        x_src = self.encoder(x_src)
+        x_encoder_output = self.encoder(x_src)
+        
+        edge_info = None
+        
+        if isinstance(x_encoder_output, dict) and 'node_embeddings' in x_encoder_output:
+            edge_info = x_encoder_output.get('edge_info')
+            x_encoded = x_encoder_output['node_embeddings']
+        else:
+            x_encoded = x_encoder_output
 
         if self.decoder_dict_once is not None:
-            x_src = torch.cat([x_src, self.decoder_dict_once_embeddings.repeat(1, x_src.shape[1], 1)], dim=0)
+            x_encoded = torch.cat([x_encoded, self.decoder_dict_once_embeddings.repeat(1, x_encoded.shape[1], 1)], dim=0)
 
-        y_src = self.y_encoder(y_src.unsqueeze(-1) if len(y_src.shape) < len(x_src.shape) else y_src) if y_src is not None else None
+        if y_src is not None and self.y_encoder is not None:
+            y_shape_adjusted = y_src.unsqueeze(-1) if len(y_src.shape) < len(x_encoded.shape) else y_src
+            if edge_info is not None:
+                edge_emb, edge_index_enc, batch_enc, position_enc, node_offset_map = edge_info
+                y_encoded = self.y_encoder(
+                    y_shape_adjusted,
+                    edge_emb=edge_emb,
+                    edge_index=edge_index_enc,
+                    batch=batch_enc,
+                    position=position_enc,
+                    node_offset_map=node_offset_map
+                )
+            else:
+                y_encoded = self.y_encoder(y_shape_adjusted)
+        else:
+            y_encoded = None
+
         if self.style_encoder:
             assert style_src is not None, 'style_src must be given if style_encoder is used'
             style_src = self.style_encoder(style_src).unsqueeze(0)
         else:
-            style_src = torch.tensor([], device=x_src.device)
-        global_src = torch.tensor([], device=x_src.device) if self.global_att_embeddings is None else \
-            self.global_att_embeddings.weight.unsqueeze(1).repeat(1, x_src.shape[1], 1)
+            style_src = torch.tensor([], device=x_encoded.device)
+        global_src = torch.tensor([], device=x_encoded.device) if self.global_att_embeddings is None else \
+            self.global_att_embeddings.weight.unsqueeze(1).repeat(1, x_encoded.shape[1], 1)
 
         if src_mask is not None:
             assert self.global_att_embeddings is None or isinstance(src_mask, tuple)
 
         if src_mask is None:
             if self.global_att_embeddings is None:
-                full_len = len(x_src) + len(style_src)
+                full_len = len(x_encoded) + len(style_src)
                 if self.full_attention:
-                    src_mask = bool_mask_to_att_mask(torch.ones((full_len, full_len), dtype=torch.bool)).to(x_src.device)
+                    src_mask = bool_mask_to_att_mask(torch.ones((full_len, full_len), dtype=torch.bool)).to(x_encoded.device)
                 elif self.efficient_eval_masking:
                     src_mask = single_eval_pos + len(style_src)
                 else:
-                    src_mask = self.generate_D_q_matrix(full_len, len(x_src) - single_eval_pos).to(x_src.device)
+                    src_mask = self.generate_D_q_matrix(full_len, len(x_encoded) - single_eval_pos).to(x_encoded.device)
             else:
                 src_mask_args = (self.global_att_embeddings.num_embeddings,
-                                 len(x_src) + len(style_src),
-                                 len(x_src) + len(style_src) - single_eval_pos)
-                src_mask = (self.generate_global_att_globaltokens_matrix(*src_mask_args).to(x_src.device),
-                            self.generate_global_att_trainset_matrix(*src_mask_args).to(x_src.device),
-                            self.generate_global_att_query_matrix(*src_mask_args).to(x_src.device))
+                                 len(x_encoded) + len(style_src),
+                                 len(x_encoded) + len(style_src) - single_eval_pos)
+                src_mask = (self.generate_global_att_globaltokens_matrix(*src_mask_args).to(x_encoded.device),
+                            self.generate_global_att_trainset_matrix(*src_mask_args).to(x_encoded.device),
+                            self.generate_global_att_query_matrix(*src_mask_args).to(x_encoded.device))
 
-        train_x = x_src[:single_eval_pos]
-        if y_src is not None:
-            train_x = train_x + y_src[:single_eval_pos]
-        src = torch.cat([global_src, style_src, train_x, x_src[single_eval_pos:]], 0)
+        train_x = x_encoded[:single_eval_pos]
+        if y_encoded is not None:
+            train_x = train_x + y_encoded[:single_eval_pos]
+        src = torch.cat([global_src, style_src, train_x, x_encoded[single_eval_pos:]], 0)
 
         if self.input_ln is not None:
             src = self.input_ln(src)
 
         if self.pos_encoder is not None:
             src = self.pos_encoder(src)
-
-
+            
         output = self.transformer_encoder(src, src_mask)
 
         num_prefix_positions = len(style_src)+(self.global_att_embeddings.num_embeddings if self.global_att_embeddings else 0)
@@ -220,22 +244,20 @@ class TransformerModel(nn.Module):
         else:
             out_range_start = single_eval_pos + num_prefix_positions
 
-        # In the line below, we use the indexing feature, that we have `x[i:None] == x[i:]`
         out_range_end = -len(self.decoder_dict_once_embeddings) if self.decoder_dict_once is not None else None
 
-        # take care the output once are counted from the end
-        output_once = {k: v(output[-(i+1)]) for i, (k, v) in enumerate(self.decoder_dict_once.items())}\
-            if self.decoder_dict_once is not None else {}
-
-        output = {k: v(output[out_range_start:out_range_end]) for k,v in self.decoder_dict.items()}\
-            if self.decoder_dict is not None else {}
-
-        if only_return_standard_out:
-            return output['standard']
-
-        if output_once:
-            return output, output_once
-        return output
+        output = output[out_range_start:out_range_end]
+        
+        edge_emb, edge_index, batch, position_tensor, node_offset_map = edge_info
+            
+        if edge_emb is not None and edge_index is not None and batch is not None:
+            edge_emb_reshape = edge_emb.reshape(x_src.shape[0], x_src.shape[1], -1, output.shape[-1])[single_eval_pos:]
+            edge_index = edge_index.permute(1,0).reshape(x_src.shape[0], x_src.shape[1], -1, 2)[single_eval_pos:]
+            edge_values = torch.einsum('bij, bikj->bik', output, self.edge_mlp(edge_emb_reshape))
+            ret_info = [edge_index, node_offset_map]
+            return edge_values, tuple(ret_info)
+        else:
+            return output, None
 
     @torch.no_grad()
     def init_from_small_model(self, small_model):
