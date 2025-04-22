@@ -149,7 +149,7 @@ class TSPTourEncoder(nn.Module):
         self.emsize = emsize
         self.max_nodes = max_nodes
         
-        self.backup_embedding = nn.Embedding(max_nodes, emsize)
+        # self.backup_embedding = nn.Embedding(max_nodes, emsize)
         
     def forward(self, y, edge_emb=None, edge_index=None, batch=None, position=None, node_offset_map=None):
         """

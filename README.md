@@ -1,6 +1,27 @@
 # PFNs
 
-This work follows the PFNs project.
+This work follows the PFNs project. 
+
+## Installation
+
+First, install the package in development mode:
+
+```bash
+git clone https://github.com/evanyfyang/PFN-TSP.git
+cd PFNs
+pip install -e .
+```
+
+Then, install the required PyTorch Geometric dependencies:
+
+```bash
+pip install --no-index torch-scatter==2.0.7 -f https://pytorch-geometric.com/whl/torch-1.7.0+cu110.html
+pip install --no-index torch-sparse==0.6.9 -f https://pytorch-geometric.com/whl/torch-1.7.0+cu110.html
+pip install --no-index torch-cluster==1.5.9 -f https://pytorch-geometric.com/whl/torch-1.7.0+cu110.html
+pip install torch-geometric==2.0.4
+```
+
+**Note:** The torch and CUDA versions in the installation commands should match your system's configuration. The example above uses torch-1.7.0 with CUDA 11.0. Adjust these versions according to your environment.
 
 ## Running Training
 
@@ -14,6 +35,26 @@ Where:
 - `-s 20`: minimum number of nodes
 - `-l 20`: maximum number of nodes
 - `-g 0`: specifies GPU 0 for training
+
+## Testing
+
+To evaluate a trained model on the TSP task, use:
+
+```bash
+python scripts/train_and_evaluate_tsp.py --emsize 256 --nhid 256 --nlayers 3 --nhead 8 --dropout 0.1 --min_nodes 20 --max_nodes 20 --test_size 20 --model_path <model_path> --decoding_strategy greedy_all
+```
+
+Parameters explanation:
+- `--min_nodes` and `--max_nodes`: Define the graph size range for testing
+- `--emsize`, `--nhid`, `--nlayers`, `--nhead`, `--dropout`: Model architecture parameters (must match the parameters used during training)
+- `--test_size`: Number of test instances
+- `--model_path`: Path to the trained model file
+- `--decoding_strategy`: Method used for solving TSP, available options:
+  - `greedy`: Greedy node selection
+  - `beam_search`: Beam search for path finding
+  - `mcmc`: Monte Carlo Markov Chain sampling
+  - `greedy_all`: Greedy algorithm considering all nodes as starting points
+  - `beam_search_all`: Beam search considering all nodes as starting points
 
 
 

@@ -17,6 +17,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from pfns.train_tsp import train_tsp
 from pfns.priors.tsp_data_loader import TSPDataLoader
 from pfns.priors.prior import Batch
+from pfns.priors.tsp_decoding_strategies import greedy_decode, greedy_all_decode, beam_search_decode, beam_search_all_decode, mcmc_decode
 
 def parse_args():
     """Parse command line arguments"""
@@ -37,7 +38,8 @@ def parse_args():
     parser.add_argument('--cuda_device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu', help='Device')
     parser.add_argument('--train', action='store_true', help='Whether to train the model (otherwise just test)')
     parser.add_argument('--model_path', type=str, default=None, help='Path to pretrained model for testing')
-    parser.add_argument('--decoding_strategy', type=str, default='greedy', choices=['greedy', 'beam_search', 'mcmc'], 
+    parser.add_argument('--decoding_strategy', type=str, default='greedy', 
+                        choices=['greedy', 'beam_search', 'mcmc', 'greedy_all', 'beam_search_all'], 
                         help='Decoding strategy for TSP')
     
     return parser.parse_args()
@@ -115,137 +117,15 @@ def predict_tsp_with_pfn(model, coords, solution, device='cuda', decoding_strate
 
         #greedy search for the tour
         if decoding_strategy == 'greedy':
-            current_node = 0
-            tour = [current_node]
-            visited = set([current_node])
-            
-            while len(tour) < num_nodes:
-                neighbors = adj_list[current_node]
-                
-                valid_neighbors = [(node, prob) for node, prob in neighbors if node not in visited]
-                
-                # if there are no valid neighbors, choose the first unvisited node (this might be happened in knn graph)
-                if not valid_neighbors:
-                    unvisited = list(set(range(num_nodes)) - visited)
-                    if unvisited:
-                        next_node = unvisited[0]
-                    else:
-                        break
-                else:
-                    next_node = max(valid_neighbors, key=lambda x: x[1])[0]
-                
-                tour.append(next_node)
-                visited.add(next_node)
-                current_node = next_node
-        
+            tour = greedy_decode(adj_list, num_nodes)
+        elif decoding_strategy == 'greedy_all':
+            tour = greedy_all_decode(adj_list, num_nodes)
         elif decoding_strategy == 'beam_search':
-            beam_width = 5
-
-            initial_path = [0]
-            initial_visited = set([0])
-            
-            beam = [(initial_path, initial_visited, 1.0)]
-            
-            while beam and len(beam[0][0]) < num_nodes:
-                new_candidates = []
-                
-                for path, visited, path_prob in beam:
-                    current_node = path[-1]
-                    neighbors = adj_list[current_node]
-                    valid_neighbors = [(node, prob) for node, prob in neighbors if node not in visited]
-                    
-                    if not valid_neighbors:
-                        unvisited = list(set(range(num_nodes)) - visited)
-                        for next_node in unvisited[:beam_width]:
-                            new_path = path + [next_node]
-                            new_visited = visited.copy()
-                            new_visited.add(next_node)
-                            new_candidates.append((new_path, new_visited, path_prob * 0.5))
-                    else:
-                        for next_node, edge_prob in valid_neighbors:
-                            new_path = path + [next_node]
-                            new_visited = visited.copy()
-                            new_visited.add(next_node)
-                            new_candidates.append((new_path, new_visited, path_prob * edge_prob))
-                if not new_candidates:
-                    break
-                beam = sorted(new_candidates, key=lambda x: x[2], reverse=True)[:beam_width]
-            
-            if beam:
-                tour = beam[0][0]
-            else:
-                tour = list(range(num_nodes))
-        
+            tour = beam_search_decode(adj_list, num_nodes)
+        elif decoding_strategy == 'beam_search_all':
+            tour = beam_search_all_decode(adj_list, num_nodes)
         elif decoding_strategy == 'mcmc':
-            current_node = 0
-            initial_tour = [current_node]
-            visited = set([current_node])
-            
-            while len(initial_tour) < num_nodes:
-                neighbors = adj_list[current_node]
-                valid_neighbors = [(node, prob) for node, prob in neighbors if node not in visited]
-                
-                if not valid_neighbors:
-                    unvisited = list(set(range(num_nodes)) - visited)
-                    if unvisited:
-                        next_node = unvisited[0]
-                    else:
-                        break
-                else:
-                    next_node = max(valid_neighbors, key=lambda x: x[1])[0]
-                
-                initial_tour.append(next_node)
-                visited.add(next_node)
-                current_node = next_node
-            
-            prob_lookup = {}
-            for i, (u, v) in enumerate(edge_index):
-                u_real = node_map[u]
-                v_real = node_map[v]
-                prob_lookup[(u_real, v_real)] = edge_values[i]
-                prob_lookup[(v_real, u_real)] = edge_values[i]  # 无向图
-            
-            def calculate_tour_probability(tour):
-                total_log_prob = 0
-                for i in range(len(tour)):
-                    u = tour[i]
-                    v = tour[(i+1) % len(tour)]
-                    edge = (u, v)
-                    prob = prob_lookup.get(edge, 0.01)
-                    total_log_prob += np.log(prob)
-                return total_log_prob
-            
-            num_iterations = 1000  
-            temperature = 1.0  
-            
-            current_tour = initial_tour
-            current_prob = calculate_tour_probability(current_tour)
-            best_tour = current_tour.copy()
-            best_prob = current_prob
-            
-            for _ in range(num_iterations):
-                i, j = sorted(np.random.choice(range(num_nodes), 2, replace=False))
-                if i == 0 and j == num_nodes - 1:
-                    continue  
-                
-                # 2-opt swap
-                new_tour = current_tour.copy()
-                new_tour[i:j+1] = reversed(current_tour[i:j+1])
-                
-                new_prob = calculate_tour_probability(new_tour)
-                
-                # Metropolis-Hastings
-                acceptance_ratio = np.exp((new_prob - current_prob) / temperature)
-                if np.random.random() < acceptance_ratio:
-                    current_tour = new_tour
-                    current_prob = new_prob
-                    
-                    if current_prob > best_prob:
-                        best_tour = current_tour.copy()
-                        best_prob = current_prob
-            
-            tour = best_tour
-        
+            tour = mcmc_decode(adj_list, node_map, edge_index, edge_values, num_nodes)
         else:
             raise ValueError(f"Unknown decoding strategy: {decoding_strategy}")
     
@@ -386,7 +266,7 @@ def load_tsp_model(model_path, emsize, nhid, nlayers, nhead, dropout, device='cu
         epochs=0, 
         steps_per_epoch=1,
         batch_size=1,
-        seq_len=1,
+        seq_len=10,
         lr=1e-4,
         num_nodes_range=(1, 2),
         gpu_device=device
@@ -394,7 +274,7 @@ def load_tsp_model(model_path, emsize, nhid, nlayers, nhead, dropout, device='cu
     
     model = result.model
     
-    model.load_state_dict(torch.load(model_path, map_location=device))
+    model.load_state_dict(torch.load(model_path, map_location=device), strict=False)
     model = model.to(device)
     model.eval()
     
