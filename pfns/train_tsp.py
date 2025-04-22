@@ -79,7 +79,7 @@ class TSPAttentionCriterion(nn.Module):
         weights[edge_labels == 0] = 0.1
         weights[edge_mask == 0] = 0.0
         
-        losses = (self.bce(output, edge_labels) * weights).sum(dim=-1)
+        losses = (self.bce(output, edge_labels) * weights).sum(dim=-1) / targets.shape[-1]
         
         return losses
         

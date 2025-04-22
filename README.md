@@ -1,6 +1,25 @@
 # PFNs
 
-Prior-data Fitted Networks (PFNs, https://arxiv.org/abs/2112.10510) are transformer encoders trained to perform supervised in-context learning on datasets randomly drawn from a prior.
+This work follows the PFNs project.
+
+## Running Training
+
+To train the model for the Traveling Salesman Problem (TSP), use the following command:
+
+```bash
+bash scripts/train_tsp.sh -s 20 -l 20 -g 0
+```
+
+Where:
+- `-s 20`: minimum number of nodes
+- `-l 20`: maximum number of nodes
+- `-g 0`: specifies GPU 0 for training
+
+
+
+
+
+<!-- Prior-data Fitted Networks (PFNs, https://arxiv.org/abs/2112.10510) are transformer encoders trained to perform supervised in-context learning on datasets randomly drawn from a prior.
 Our priors can in general be described by a function that samples a datasets, or more generally a batch of datasets.
 The PFN is then trained to predict a hold-out set of labels, given the rest of the dataset.
 
@@ -127,5 +146,5 @@ The "Bayes' Power for Explaining In-Context Learning Generalizations" is
   journal={arXiv preprint arXiv:2410.01565},
   year={2024}
 }
-```
+``` -->
 

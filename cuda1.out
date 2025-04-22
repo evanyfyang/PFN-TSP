@@ -1,0 +1,15 @@
+nohup: ignoring input
+Starting TSP training (nodes: 10-10)...
+Using GPU: 1
+=== Training Mode ===
+Starting TSP model training...
+Parameters: Namespace(emsize=256, nhid=256, nlayers=3, nhead=8, dropout=0.1, epochs=20, steps_per_epoch=100, batch_size=32, lr=0.0001, min_nodes=10, max_nodes=10, test_size=5, save_dir='./saved_models', cuda_device='cuda', train=True, model_path=None, decoding_strategy='greedy')
+Training TSP model on cuda with 256 embedding size
+Using cuda device
+init dist
+Not using distributed
+Using 32 processes for TSP solving
+Style definition of first 3 examples: None
+Initialized decoder for standard with (None, 1)  and nout 1
+Using a Transformer with 2.31 M parameters
+Training Epoch:   0%|          | 0/100 [00:00<?, ?it/s]Training Epoch:   1%|          | 1/100 [00:00<01:15,  1.32it/s]Training Epoch:   1%|          | 1/100 [00:03<01:15,  1.32it/s, data_time=0.761, step_time=2.76, mean_loss=3.73]Training Epoch:   2%|▏         | 2/100 [00:04<04:31,  2.77s/it, data_time=0.761, step_time=2.76, mean_loss=3.73]Training Epoch:   2%|▏         | 2/100 [00:07<04:31,  2.77s/it, data_time=1.42, step_time=2.2, mean_loss=3.64]  Training Epoch:   3%|▎         | 3/100 [00:08<05:16,  3.26s/it, data_time=1.42, step_time=2.2, mean_loss=3.64]Training Epoch:   3%|▎         | 3/100 [00:11<05:16,  3.26s/it, data_time=1.64, step_time=2.25, mean_loss=3.62]Training Epoch:   4%|▍         | 4/100 [00:12<05:24,  3.38s/it, data_time=1.64, step_time=2.25, mean_loss=3.62]Training Epoch:   4%|▍         | 4/100 [00:14<05:24,  3.38s/it, data_time=1.31, step_time=2.1, mean_loss=3.56] Training Epoch:   5%|▌         | 5/100 [00:15<05:23,  3.41s/it, data_time=1.31, step_time=2.1, mean_loss=3.56]Training Epoch:   5%|▌         | 5/100 [00:17<05:23,  3.41s/it, data_time=1.35, step_time=2.09, mean_loss=3.6]Training Epoch:   6%|▌         | 6/100 [00:19<05:23,  3.44s/it, data_time=1.35, step_time=2.09, mean_loss=3.6]Training Epoch:   6%|▌         | 6/100 [00:21<05:23,  3.44s/it, data_time=1.42, step_time=1.94, mean_loss=3.6]Training Epoch:   7%|▋         | 7/100 [00:22<05:20,  3.45s/it, data_time=1.42, step_time=1.94, mean_loss=3.6]Training Epoch:   7%|▋         | 7/100 [00:24<05:20,  3.45s/it, data_time=1.51, step_time=1.93, mean_loss=3.6]Training Epoch:   8%|▊         | 8/100 [00:26<05:13,  3.40s/it, data_time=1.51, step_time=1.93, mean_loss=3.6]Training Epoch:   8%|▊         | 8/100 [00:28<05:13,  3.40s/it, data_time=1.38, step_time=2.02, mean_loss=3.59]Training Epoch:   9%|▉         | 9/100 [00:29<05:13,  3.45s/it, data_time=1.38, step_time=2.02, mean_loss=3.59]Training Epoch:   9%|▉         | 9/100 [00:31<05:13,  3.45s/it, data_time=1.53, step_time=1.83, mean_loss=3.62]Training Epoch:  10%|█         | 10/100 [00:32<05:02,  3.37s/it, data_time=1.53, step_time=1.83, mean_loss=3.62]Training Epoch:  10%|█         | 10/100 [00:34<05:02,  3.37s/it, data_time=1.35, step_time=1.76, mean_loss=3.64]Training Epoch:  11%|█         | 11/100 [00:35<04:52,  3.29s/it, data_time=1.35, step_time=1.76, mean_loss=3.64]

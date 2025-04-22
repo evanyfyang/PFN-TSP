@@ -20,7 +20,7 @@ echo "Using GPU: $GPU"
 
 export CUDA_VISIBLE_DEVICES=$GPU
 
-python -m pdb scripts/train_and_evaluate_tsp.py \
+python scripts/train_and_evaluate_tsp.py \
     --emsize 256 \
     --nhid 256 \
     --nlayers 3 \
