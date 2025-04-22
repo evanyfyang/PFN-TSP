@@ -44,6 +44,12 @@ To evaluate a trained model on the TSP task, use:
 python scripts/train_and_evaluate_tsp.py --emsize 256 --nhid 256 --nlayers 3 --nhead 8 --dropout 0.1 --min_nodes 20 --max_nodes 20 --test_size 20 --model_path <model_path> --decoding_strategy greedy_all
 ```
 
+If you want to specify which GPU to use, add the `CUDA_VISIBLE_DEVICES` environment variable before the command:
+
+```bash
+CUDA_VISIBLE_DEVICES=<gpu_id> python scripts/train_and_evaluate_tsp.py --emsize 256 --nhid 256 --nlayers 3 --nhead 8 --dropout 0.1 --min_nodes 20 --max_nodes 20 --test_size 20 --model_path <model_path> --decoding_strategy greedy_all
+```
+
 Parameters explanation:
 - `--min_nodes` and `--max_nodes`: Define the graph size range for testing
 - `--emsize`, `--nhid`, `--nlayers`, `--nhead`, `--dropout`: Model architecture parameters (must match the parameters used during training)
@@ -56,136 +62,108 @@ Parameters explanation:
   - `greedy_all`: Greedy algorithm considering all nodes as starting points
   - `beam_search_all`: Beam search considering all nodes as starting points
 
+## Code Guide
 
+All running scripts are located in the `scripts` directory. You can use `train_tsp.sh` for training and `train_and_evaluate_tsp.py` for testing, with parameters as described in the Training and Testing sections above.
 
+The core source code is organized in the `pfns` directory. The modified training main function is `train_tsp()` in `train_tsp.py`, which calls and modifies the original `train()` function. The implementation consists of three main components:
 
+### 1. Data Loader
+Located in `/pfns/priors/tsp_data_loader.py`, the data loader generates batch data for each step within an epoch. It handles the TSP instance creation and provides appropriate batches for training.
+
+### 2. Model
+The model implementation is in `/pfns/transformer.py`, with the main function being `forward()`. We extended the original code by adding encoders for both inputs (x) and outputs (y). These encoders are implemented in `/pfns/priors/tsp_encoder.py`.
+
+### 3. Encoders
+There are two key encoders:
+- **TSPGraphEncoder**: This utilizes GNN code from `/pfns/tsp_net.py` to transform TSP instances from point sets to fully-connected graphs, then to graph embeddings (graph_emb or x_encoded) and edge embeddings.
+- **TSPTourEncoder**: This combines edge embeddings with output tours (y) to produce y_encoded.
+
+### Model Workflow
+In `transformer.py`, these components are integrated to encode each instance. Following the PFN implementation:
+- Context positions receive x_encoded + y_encoded (without positional embeddings)
+- Target positions receive only x_encoded
+
+After obtaining the transformer output, we extract the target positions and compute attention with all edges of each graph (using torch.einsum) to obtain unnormalized edge values. These edge values and edge information are passed back to the train function for loss calculation.
+
+### Loss Calculation
+Since a tour is a sequence, we first convert it to edge labels in the graph. To prevent duplication, we only keep edges from nodes with smaller indices to nodes with larger indices. We then compute the BCE loss with logits, which first applies sigmoid to transform values into probability distributions before calculating BCE loss. To prevent gradient explosion, the total loss is divided by the number of nodes.
+
+## Server Usage Guide
+
+### Accessing the GPU Server
+
+You can access the lab's GPU server using SSH:
+
+```bash
+ssh sfu_user_name@cs-airob-gpu01.cmpt.sfu.ca
+```
+
+Use your SFU password for authentication. We recommend using VS Code with the Remote-SSH extension for a better development experience.
+
+### CUDA Environment Setup
+
+Before running any code, load the CUDA modules for compatibility with the codebase:
+
+```bash
+module load LIB/CUDA/11.8
+module load LIB/CUDNN/8.8.0-CUDA11.8
+```
+
+For automatic loading of these modules at login, create or edit `~/privatemodule/login` with the following content:
+
+```
+#%Module1.0
+module load LIB/CUDA/11.8
+module load LIB/CUDNN/8.8.0-CUDA11.8
+```
+
+### Virtual Environment Setup
+
+Install Conda to manage your virtual environment. Create a new environment with Python 3.10.0:
+
+```bash
+conda create -n pfn_tsp python=3.10.0
+conda activate pfn_tsp
+```
+
+Then proceed with the installation steps as described in the Installation section.
+
+### GPU Management
+
+Before running code, check GPU availability using:
+
+```bash
+gpustat
+```
+
+or
+
+```bash
+nvidia-smi
+```
+
+Please use an idle GPU to avoid conflicts with other users.
+
+### CPU Load Management
+
+The dataloader uses multi-threading by default. If you plan to run multiple jobs or notice high CPU load, modify the `num_processes` parameter in the dataloader:
+
+```python
+# In pfns/priors/tsp_data_loader.py
+num_processes: int = 8  # or 16, depending on server load
+```
+
+### Running Jobs in Background
+
+To run training jobs in the background, use:
+
+```bash
+nohup bash scripts/train_tsp.sh <your parameters> ><your_outputfile> 2>&1 &
+```
+
+This allows you to log out while your job continues running, with all output saved to the specified file.
 
 <!-- Prior-data Fitted Networks (PFNs, https://arxiv.org/abs/2112.10510) are transformer encoders trained to perform supervised in-context learning on datasets randomly drawn from a prior.
-Our priors can in general be described by a function that samples a datasets, or more generally a batch of datasets.
-The PFN is then trained to predict a hold-out set of labels, given the rest of the dataset.
-
-The pseudo code for a simple prior that would yield a PFN that does 1d ridge regression on datasets with 100 elements, could be something like this:
-
-```python
-def get_dataset_sample():
-    x = RandomUniform(100,1)
-    a = RandomNormal()
-    b = RandomNormal()
-    y = a * x + b
-    return x, y
-```
-
-Check out our [tutorial](https://colab.research.google.com/drive/12YpI99LkuFeWcuYHt_idl142DqX7AaJf) to train your own ridge regression PFN.
-
-### Install with pip
-
-This way of installing allows you to use the package everywhere and still be able to edit files.
-You should use a python version **>=3.10 and <=3.11**.
-```bash
-git clone https://github.com/automl/PFNs.git
-cd PFNs
-pip install -e .
-```
-
-### Get Started
-
-Check out our [Getting Started Colab](https://colab.research.google.com/drive/12YpI99LkuFeWcuYHt_idl142DqX7AaJf).
-
-### Tabular Data
-
-
-For loading the pretrained TabPFN transformer model for classification and use it for evaluation, you can download the model like this
-
-```python
-import torch
-from pfns.scripts.tabpfn_interface import TabPFNClassifier
-# Load pretrained-model
-classifier = TabPFNClassifier(base_path='.', model_string="prior_diff_real_checkpoint_n_0_epoch_42.cpkt")
-
-train_xs = torch.rand(100,2)
-test_xs = torch.rand(100,2)
-train_ys = train_xs.mean(1) > .5
-# Fit and evaluate
-task_type = 'multiclass'
-classifier.fit(train_xs, train_ys)
-if task_type == 'multiclass':
-    prediction_ = classifier.predict_proba(test_xs) # For survival [:, 1:]
-else:
-    prediction_ = classifier.predict(test_xs)
-```
-
-
-### BO
-
-There is a BO version of this repo, with pretrained models at [github.com/automl/PFNs4BO](https://github.com/automl/PFNs4BO).
-The two repos share a lot of the code, but the other is not anymore actively maintained.
-You can also train your own models with our tutorial notebook [here](Tutorial_Training_for_BO.ipynb).
-
-To run all BayesOpt experiments, please install this package with the `benchmarks` option:
-```bash
-pip install -e .[benchmarks]
-```
-
-### Bayes' Power for Explaining In-Context Learning Generalizations
-
-This repository contains the code for the paper "Bayes' Power for Explaining In-Context Learning Generalizations".
-
-Install in editable mode:
-```bash
-pip install -e .
-```
-
-We have a set of notebooks in this repository to reproduce the results of our paper.
-
-- To reproduce the main ICL experiments, use the notebook `discrete_bayes.ipynb`.
-- To run the Tiny-MLP generalization experiments, where we evaluate extrapolation, use the notebook `Tiny_MLP_Generalization.ipynb`.
-- To run the Coin-Flipping experiments, where we show that the true posterior converges to the wrong probability, use the notebook `Cointhrowing_converging_to_wrong_posterior.ipynb`.
-- To see the GP converging to the wrong solution for a step function, use the notebook `GP_fitting_a_step.ipynb`.
-
-
-### Cite the work
-
-PFNs were introduced in
-```
-@inproceedings{
-    muller2022transformers,
-    title={Transformers Can Do Bayesian Inference},
-    author={Samuel M{\"u}ller and Noah Hollmann and Sebastian Pineda Arango and Josif Grabocka and Frank Hutter},
-    booktitle={International Conference on Learning Representations},
-    year={2022},
-    url={https://openreview.net/forum?id=KSugKcbNf9}
-}
-```
-
-Training PFNs on tabular data (TabPFN) was enhanced in
-```
-@inproceedings{
-  hollmann2023tabpfn,
-  title={Tab{PFN}: A Transformer That Solves Small Tabular Classification Problems in a Second},
-  author={Noah Hollmann and Samuel M{\"u}ller and Katharina Eggensperger and Frank Hutter},
-  booktitle={The Eleventh International Conference on Learning Representations},
-  year={2023},
-  url={https://openreview.net/forum?id=cp5PvcI6w8_}
-}
-```
-
-The BO version of PFNs was introduced in
-```
-@article{muller2023pfns,
-  title={PFNs4BO: In-Context Learning for Bayesian Optimization},
-  author={M{\"u}ller, Samuel and Feurer, Matthias and Hollmann, Noah and Hutter, Frank},
-  journal={arXiv preprint arXiv:2305.17535},
-  year={2023}
-}
-```
-
-The "Bayes' Power for Explaining In-Context Learning Generalizations" is
-```
-@article{muller2024bayes,
-  title={Bayes' Power for Explaining In-Context Learning Generalizations},
-  author={M{\"u}ller, Samuel and Hollmann, Noah and Hutter, Frank},
-  journal={arXiv preprint arXiv:2410.01565},
-  year={2024}
-}
-``` -->
+// ... existing code ...
 

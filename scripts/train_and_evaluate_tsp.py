@@ -154,11 +154,15 @@ def generate_test_instances_with_ortools(num_instances, num_nodes_range, device=
         num_nodes_range=num_nodes_range
     )
     
+    # Measure OR-Tools solving time
+    start_time = time.time()
     # Get a batch of data
     batch = next(iter(dataloader))
+    ortools_time = time.time() - start_time
     
     test_instances = []
     ortools_solutions = []
+    ortools_times = []
     
     # Extract coordinates and solutions
     for i in range(batch.x.shape[1]): 
@@ -167,8 +171,12 @@ def generate_test_instances_with_ortools(num_instances, num_nodes_range, device=
         
         test_instances.append(coords)
         ortools_solutions.append(solution)
+        # Approximate OR-Tools time per instance
+        ortools_times.append(ortools_time / batch.x.shape[1])
     
-    return test_instances, ortools_solutions
+    print(f"Average OR-Tools processing time: {np.mean(ortools_times):.4f} seconds")
+    
+    return test_instances, ortools_solutions, ortools_times
 
 def plot_tour(coords, tour, title, ax=None):
     if ax is None:
@@ -199,13 +207,14 @@ def calculate_tour_length(coords, tour):
     total_distance += np.linalg.norm(coords[tour[-1]] - coords[tour[0]])
     return total_distance
 
-def evaluate_and_compare(model, test_instances, ortools_solutions, device='cuda', decoding_strategy='greedy', save_plot=True, plot_path='tsp_comparison.png'):
+def evaluate_and_compare(model, test_instances, ortools_solutions, ortools_times, device='cuda', decoding_strategy='greedy', save_plot=True, plot_path='tsp_comparison.png'):
     """Evaluate model and compare with OR-Tools"""
     print(f"Starting model evaluation with {decoding_strategy} decoding strategy...")
     
     pfn_distances = []
     ortools_distances = []
     processing_times_pfn = []
+    processing_times_ortools = ortools_times
     
     viz_idx = np.random.randint(0, len(test_instances))
     
@@ -223,7 +232,7 @@ def evaluate_and_compare(model, test_instances, ortools_solutions, device='cuda'
         processing_times_pfn.append(pfn_time)
         
         print(f"Instance {i+1}: PFN distance={pfn_distance:.4f}, OR-Tools distance={ortools_distance:.4f}")
-        print(f"PFN processing time: {pfn_time:.4f} seconds")
+        print(f"PFN processing time: {pfn_time:.4f} seconds, OR-Tools processing time: {ortools_times[i]:.4f} seconds")
         
         if i == viz_idx and save_plot:
             fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 8))
@@ -245,12 +254,15 @@ def evaluate_and_compare(model, test_instances, ortools_solutions, device='cuda'
     print(f"Minimum relative gap: {np.min(relative_gap):.2f}%")
     print(f"PFN win rate: {np.mean(pfn_distances <= ortools_distances) * 100:.2f}%")
     print(f"PFN average processing time: {np.mean(processing_times_pfn):.4f} seconds")
+    print(f"OR-Tools average processing time: {np.mean(processing_times_ortools):.4f} seconds")
+    print(f"Speed ratio (OR-Tools/PFN): {np.mean(processing_times_ortools)/np.mean(processing_times_pfn):.2f}x")
     
     return {
         'pfn_distances': pfn_distances,
         'ortools_distances': ortools_distances,
         'relative_gap': relative_gap,
-        'pfn_times': processing_times_pfn
+        'pfn_times': processing_times_pfn,
+        'ortools_times': processing_times_ortools
     }
 
 def load_tsp_model(model_path, emsize, nhid, nlayers, nhead, dropout, device='cuda'):
@@ -266,7 +278,7 @@ def load_tsp_model(model_path, emsize, nhid, nlayers, nhead, dropout, device='cu
         epochs=0, 
         steps_per_epoch=1,
         batch_size=1,
-        seq_len=10,
+        seq_len=5,
         lr=1e-4,
         num_nodes_range=(1, 2),
         gpu_device=device
@@ -306,7 +318,7 @@ def main():
         model_path = args.model_path
     
     print(f"Generating test instances...")
-    test_instances, ortools_solutions = generate_test_instances_with_ortools(
+    test_instances, ortools_solutions, ortools_times = generate_test_instances_with_ortools(
         num_instances=args.test_size,
         num_nodes_range=(args.min_nodes, args.max_nodes),
         device=args.cuda_device
@@ -318,7 +330,8 @@ def main():
     results = evaluate_and_compare(
         model=model,
         test_instances=test_instances, 
-        ortools_solutions=ortools_solutions, 
+        ortools_solutions=ortools_solutions,
+        ortools_times=ortools_times,
         device=args.cuda_device, 
         decoding_strategy=args.decoding_strategy,
         plot_path=plot_path
@@ -329,7 +342,8 @@ def main():
              pfn_distances=results['pfn_distances'],
              ortools_distances=results['ortools_distances'],
              relative_gap=results['relative_gap'],
-             pfn_times=results['pfn_times'])
+             pfn_times=results['pfn_times'],
+             ortools_times=results['ortools_times'])
     
     print(f"Results saved to {results_path}")
     
