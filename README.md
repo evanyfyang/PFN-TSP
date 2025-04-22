@@ -15,13 +15,9 @@ pip install -e .
 Then, install the required PyTorch Geometric dependencies:
 
 ```bash
-pip install --no-index torch-scatter==2.0.7 -f https://pytorch-geometric.com/whl/torch-1.7.0+cu110.html
-pip install --no-index torch-sparse==0.6.9 -f https://pytorch-geometric.com/whl/torch-1.7.0+cu110.html
-pip install --no-index torch-cluster==1.5.9 -f https://pytorch-geometric.com/whl/torch-1.7.0+cu110.html
+pip install torch-scatter torch-sparse torch-cluster -f https://data.pyg.org/whl/torch-2.6.0+cu124.html
 pip install torch-geometric==2.0.4
 ```
-
-**Note:** The torch and CUDA versions in the installation commands should match your system's configuration. The example above uses torch-1.7.0 with CUDA 11.0. Adjust these versions according to your environment.
 
 ## Running Training
 
@@ -129,6 +125,24 @@ conda activate pfn_tsp
 
 Then proceed with the installation steps as described in the Installation section.
 
+### File Storage Location
+
+Since the root directory of our server is almost full, it's recommended to store your code and models in other directories with more available space. You can use the following command to check available disk space:
+
+```bash
+df -hl
+```
+
+After identifying disks with sufficient space, create your own folder in one of these locations:
+
+```bash
+mkdir /local-scratchh/<your_folder>
+# or
+mkdir /local-scratchg/<your_folder>
+```
+
+Store your code and trained models in these directories to prevent the root directory from becoming full. This is especially important for model checkpoints which can be quite large.
+
 ### GPU Management
 
 Before running code, check GPU availability using:
@@ -159,7 +173,7 @@ num_processes: int = 8  # or 16, depending on server load
 To run training jobs in the background, use:
 
 ```bash
-nohup bash scripts/train_tsp.sh <your parameters> ><your_outputfile> 2>&1 &
+nohup bash scripts/train_tsp.sh <your parameters> > <your_outputfile> 2>&1 &
 ```
 
 This allows you to log out while your job continues running, with all output saved to the specified file.
