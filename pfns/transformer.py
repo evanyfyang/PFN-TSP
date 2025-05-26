@@ -8,6 +8,7 @@ from torch.nn import Module, TransformerEncoder
 import torch.nn.functional as F
 from .layer import TransformerEncoderLayer, _get_activation_fn
 from .utils import SeqBN, bool_mask_to_att_mask
+import time
 
 
 
@@ -142,8 +143,8 @@ class TransformerModel(nn.Module):
         """
         if len(args) == 3:
             # case model(train_x, train_y, test_x, src_mask=None, style=None, only_return_standard_out=True)
-            assert all(kwarg in {'src_mask', 'style', 'only_return_standard_out'} for kwarg in kwargs.keys()), \
-                f"Unrecognized keyword argument in kwargs: {set(kwargs.keys()) - {'src_mask', 'style', 'only_return_standard_out'}}"
+            assert all(kwarg in {'src_mask', 'style', 'only_return_standard_out', 'candidate_info'} for kwarg in kwargs.keys()), \
+                f"Unrecognized keyword argument in kwargs: {set(kwargs.keys()) - {'src_mask', 'style', 'only_return_standard_out', 'candidate_info'}}"
             x = args[0]
             if args[2] is not None:
                 x = torch.cat((x, args[2]), dim=0)
@@ -152,11 +153,11 @@ class TransformerModel(nn.Module):
         elif len(args) == 1 and isinstance(args, tuple):
             # case model((x,y), src_mask=None, single_eval_pos=None, only_return_standard_out=True)
             # case model((style,x,y), src_mask=None, single_eval_pos=None, only_return_standard_out=True)
-            assert all(kwarg in {'src_mask', 'single_eval_pos', 'only_return_standard_out'} for kwarg in kwargs.keys()), \
-                f"Unrecognized keyword argument in kwargs: {set(kwargs.keys()) - {'src_mask', 'single_eval_pos', 'only_return_standard_out'}}"
+            assert all(kwarg in {'src_mask', 'single_eval_pos', 'only_return_standard_out', 'candidate_info'} for kwarg in kwargs.keys()), \
+                f"Unrecognized keyword argument in kwargs: {set(kwargs.keys()) - {'src_mask', 'single_eval_pos', 'only_return_standard_out', 'candidate_info'}}"
             return self._forward(*args, **kwargs)
 
-    def _forward(self, src, src_mask=None, single_eval_pos=None, only_return_standard_out=True):
+    def _forward(self, src, src_mask=None, single_eval_pos=None, only_return_standard_out=True, candidate_info=None):
         assert isinstance(src, tuple), 'inputs (src) have to be given as (x,y) or (style,x,y) tuple'
 
         if len(src) == 2: # (x,y) and no style
@@ -167,8 +168,12 @@ class TransformerModel(nn.Module):
         if single_eval_pos is None:
             single_eval_pos = x_src.shape[0]
 
-        x_encoder_output = self.encoder(x_src)
-        
+        # Pass candidate_info to encoder if it supports it
+        if hasattr(self.encoder, 'forward') and 'candidate_info' in self.encoder.forward.__code__.co_varnames:
+            x_encoder_output = self.encoder(x_src, candidate_info=candidate_info)
+        else:
+            x_encoder_output = self.encoder(x_src)
+
         edge_info = None
         
         if isinstance(x_encoder_output, dict) and 'node_embeddings' in x_encoder_output:
@@ -183,13 +188,13 @@ class TransformerModel(nn.Module):
         if y_src is not None and self.y_encoder is not None:
             y_shape_adjusted = y_src.unsqueeze(-1) if len(y_src.shape) < len(x_encoded.shape) else y_src
             if edge_info is not None:
-                edge_emb, edge_index_enc, batch_enc, position_enc, node_offset_map = edge_info
+                edge_emb, edge_index, batch, position_tensor, node_offset_map, edge_counts = edge_info
                 y_encoded = self.y_encoder(
                     y_shape_adjusted,
                     edge_emb=edge_emb,
-                    edge_index=edge_index_enc,
-                    batch=batch_enc,
-                    position=position_enc,
+                    edge_index=edge_index,
+                    batch=batch,
+                    position=position_tensor,
                     node_offset_map=node_offset_map
                 )
             else:
@@ -237,7 +242,6 @@ class TransformerModel(nn.Module):
             src = self.pos_encoder(src)
             
         output = self.transformer_encoder(src, src_mask)
-
         num_prefix_positions = len(style_src)+(self.global_att_embeddings.num_embeddings if self.global_att_embeddings else 0)
         if self.return_all_outputs:
             out_range_start = num_prefix_positions
@@ -248,14 +252,38 @@ class TransformerModel(nn.Module):
 
         output = output[out_range_start:out_range_end]
         
-        edge_emb, edge_index, batch, position_tensor, node_offset_map = edge_info
+        edge_emb, edge_index, batch, position_tensor, node_offset_map, edge_counts = edge_info
             
         if edge_emb is not None and edge_index is not None and batch is not None:
-            edge_emb_reshape = edge_emb.reshape(x_src.shape[0], x_src.shape[1], -1, output.shape[-1])[single_eval_pos:]
-            edge_index = edge_index.permute(1,0).reshape(x_src.shape[0], x_src.shape[1], -1, 2)[single_eval_pos:]
-            edge_values = torch.einsum('bij, bikj->bik', output, self.edge_mlp(edge_emb_reshape))
-            ret_info = [edge_index, node_offset_map]
-            return edge_values, tuple(ret_info)
+            edge_emb_list = torch.split(edge_emb, edge_counts, dim=0)
+            edge_index_list = torch.split(edge_index.permute(1, 0), edge_counts, dim=0)
+            seq_eval_len = x_src.shape[0] - single_eval_pos
+            batch_size = x_src.shape[1]
+            max_edges = max(edge_counts)
+            edge_embs_padded = torch.zeros(seq_eval_len * batch_size, max_edges, edge_emb.size(-1), device=edge_emb.device)
+            valid_edges_mask = torch.zeros(seq_eval_len * batch_size, max_edges, dtype=torch.bool, device=edge_emb.device)
+            
+            idx = 0
+            for pos in range(single_eval_pos, x_src.shape[0]):
+                pos_idx = pos - single_eval_pos
+                for b in range(batch_size):
+                    flat_idx = pos_idx * batch_size + b
+                    num_edges = edge_counts[idx]
+                    edge_embs_padded[flat_idx, :num_edges] = edge_emb_list[idx]
+                    valid_edges_mask[flat_idx, :num_edges] = True
+                    idx += 1
+            
+            orig_shape = edge_embs_padded.shape
+            flat_embs = edge_embs_padded.reshape(-1, edge_emb.size(-1))
+            processed_embs = self.edge_mlp(flat_embs).reshape(orig_shape)
+            output_reshaped = output.reshape(seq_eval_len * batch_size, -1).unsqueeze(1)
+            edge_values_batch = torch.bmm(output_reshaped, processed_embs.transpose(1, 2)).squeeze(1)
+            edge_values_padded = edge_values_batch.reshape(seq_eval_len, batch_size, max_edges)
+            
+            edge_values_padded = edge_values_padded * valid_edges_mask.reshape(seq_eval_len, batch_size, max_edges).float()
+
+            ret_info = [edge_index_list, node_offset_map, edge_counts]
+            return edge_values_padded, tuple(ret_info)
         else:
             return output, None
 

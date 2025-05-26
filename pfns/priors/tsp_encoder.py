@@ -6,6 +6,7 @@ import torch_geometric.utils as g_utils
 from torch_geometric.nn import global_mean_pool
 import math
 from ..tsp_nets import Net
+from scipy.spatial import Delaunay
 
 class Args:
     """Helper class to provide args for Net initialization"""
@@ -51,7 +52,7 @@ class TSPGraphEncoder(nn.Module):
         self.net = Net(args)
     
         
-    def forward(self, x):
+    def forward(self, x, candidate_info=None):
         """
         Forward pass through the GNN encoder.
         
@@ -61,11 +62,16 @@ class TSPGraphEncoder(nn.Module):
                 - batch: Batch size
                 - num_nodes: Number of nodes in each TSP instance
                 - 2: X,Y coordinates
+            candidate_info: List of candidate information dictionaries from LKH3, one for each (seq_len, batch) pair
+                Each dictionary contains:
+                - dimension: Number of nodes
+                - candidates: Dict mapping node_id to list of (neighbor_id, alpha_value) tuples
+                - mst_parents: Dict mapping node_id to parent in MST
         
         Returns:
             Dictionary containing:
                 - node_embeddings: Tensor of shape (seq_len, batch, emsize)
-                - edge_info: Tuple of (edge_emb, edge_index, batch_tensor, position_tensor, node_offset_map)
+                - edge_info: Tuple of (edge_emb, edge_index, batch_tensor, position_tensor, node_offset_map, edge_counts)
         """
         # Get dimensions
         seq_len, batch_size, num_nodes, _ = x.shape
@@ -78,6 +84,8 @@ class TSPGraphEncoder(nn.Module):
         cumulative_nodes = 0
         node_offset_map = {}  
         
+        edge_counts = []  
+        
         for pos in range(seq_len):
             for b in range(batch_size):
                 coords = x[pos, b]  # (num_nodes, 2)
@@ -85,30 +93,54 @@ class TSPGraphEncoder(nn.Module):
                 for n in range(num_nodes):
                     node_offset_map[(pos, b, n)] = cumulative_nodes + n
                 
-                # Create fully connected UNDIRECTED graph for TSP instance
-                # Use only upper triangular part to avoid duplicating edges
-                adj_matrix = torch.triu(torch.ones(num_nodes, num_nodes, device=x.device), diagonal=1)
-                one_way_edge_index = g_utils.dense_to_sparse(adj_matrix)[0]
+                # Use candidate_info if available, otherwise fall back to complete graph
+                if candidate_info is not None:
+                    # Calculate the index in the flattened candidate_info list
+                    candidate_idx = pos * batch_size + b
+                    if candidate_idx < len(candidate_info) and candidate_info[candidate_idx] is not None:
+                        # Use LKH3 candidate edges
+                        edges = set()
+                        cand_info = candidate_info[candidate_idx]
+                        
+                        # Extract edges from candidate information
+                        for node_id, candidates in cand_info['candidates'].items():
+                            # Convert from 1-based to 0-based indexing
+                            src_node = node_id - 1
+                            for neighbor_id, alpha_value in candidates:
+                                dst_node = neighbor_id - 1
+                                # Add undirected edge (both directions)
+                                edges.add((min(src_node, dst_node), max(src_node, dst_node)))
+                        
+                        if len(edges) > 0:
+                            edge_index = torch.tensor(list(edges), dtype=torch.long, device=x.device).t().contiguous()
+                        else:
+                            # Fallback to complete graph if no candidates
+                            adj_matrix = torch.triu(torch.ones(num_nodes, num_nodes, device=x.device), diagonal=1)
+                            edge_index = g_utils.dense_to_sparse(adj_matrix)[0]
+                    else:
+                        # Fallback to complete graph if candidate_info is missing
+                        adj_matrix = torch.triu(torch.ones(num_nodes, num_nodes, device=x.device), diagonal=1)
+                        edge_index = g_utils.dense_to_sparse(adj_matrix)[0]
+                else:
+                    # Fallback to complete graph if no candidate_info provided
+                    adj_matrix = torch.triu(torch.ones(num_nodes, num_nodes, device=x.device), diagonal=1)
+                    edge_index = g_utils.dense_to_sparse(adj_matrix)[0]
+
+                edge_index += cumulative_nodes
                 
-                # Calculate edge attributes (distances) before making undirected
-                rows, cols = one_way_edge_index
-                edge_attr = torch.norm(coords[rows] - coords[cols], dim=1).unsqueeze(1)  # (num_edges, 1)
+                rows, cols = edge_index - cumulative_nodes
+                edge_attr = torch.norm(coords[rows] - coords[cols], dim=1).unsqueeze(1)
+                edge_index = g_utils.to_undirected(edge_index)
+                edge_attr = edge_attr.repeat(2, 1)
                 
-                # Make edge_index undirected (adds reverse edges)
-                edge_index = g_utils.to_undirected(one_way_edge_index)
-                
-                # Create edge attributes for both directions (same distance for both directions)
-                edge_attr = edge_attr.repeat(2, 1)  # Duplicate for reverse edges
-                
-                offset_edge_index = edge_index + cumulative_nodes
-                
-                all_edge_indices.append(offset_edge_index)
+                all_edge_indices.append(edge_index)
                 all_edge_attrs.append(edge_attr)
                 
                 all_batch_ids.append(torch.full((num_nodes,), b, dtype=torch.long, device=x.device))
                 all_position_ids.append(torch.full((num_nodes,), pos, dtype=torch.long, device=x.device))
                 
                 cumulative_nodes += num_nodes
+                edge_counts.append(edge_index.size(1))  
         
         edge_index = torch.cat(all_edge_indices, dim=1)
         edge_attr = torch.cat(all_edge_attrs, dim=0)
@@ -129,7 +161,7 @@ class TSPGraphEncoder(nn.Module):
         # Return both node embeddings and edge information in a dictionary
         return {
             'node_embeddings': graph_emb,
-            'edge_info': (edge_emb, edge_index, batch_tensor, position_tensor, node_offset_map),
+            'edge_info': (edge_emb, edge_index, batch_tensor, position_tensor, node_offset_map, edge_counts),
         }
 
 

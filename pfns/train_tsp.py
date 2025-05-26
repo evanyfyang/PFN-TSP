@@ -23,6 +23,7 @@ from . import positional_encodings
 from .utils import init_dist, bool_mask_to_att_mask
 from .priors.tsp_data_loader import TSPDataLoader
 from .priors.tsp_encoder import tsp_graph_encoder_generator, tsp_tour_encoder_generator
+from torch.autograd import profiler
 
 class TSPAttentionCriterion(nn.Module):
     def __init__(self):
@@ -30,56 +31,42 @@ class TSPAttentionCriterion(nn.Module):
         self.bce = nn.BCEWithLogitsLoss(reduction='none')
 
     def forward(self, output, targets, edge_info):
-        edge_index, node_offset_map = edge_info
-        seq_len, batch_size, _ = targets.shape
+        edge_index_list, node_offset_map, edge_counts = edge_info
+        seq_len, batch_size, num_nodes = targets.shape
         
-        edge_index = edge_index.cpu().tolist()
+        losses = torch.zeros((seq_len, batch_size), device=output.device)
         
         reversed_node_map = {value: key for key, value in node_offset_map.items()}
         
-        edge_mask = torch.zeros_like(output)
-        edge_labels = torch.zeros_like(output)
-        flattened_edges = []
-        flattened_positions = []
-        
+        idx = 0
         for i in range(seq_len):
             for j in range(batch_size):
-                edges = edge_index[i][j]
-                for e_idx, edge in enumerate(edges):
-                    node0 = reversed_node_map[edge[0]][-1]
-                    node1 = reversed_node_map[edge[1]][-1]
-                    
-                    if node0 > node1:
-                        continue
-                    
-                    flattened_edges.append((node0, node1))
-                    flattened_positions.append((i, j, e_idx))
-        
-        tours = targets.cpu()
-        tour_edges = {}
-        
-        for i in range(seq_len):
-            for j in range(batch_size):
-                tour = tours[i, j]
-                tour_len = tour.shape[0]
-                tour_edge_set = set()
+                num_edges = edge_counts[idx]
+                edges = edge_index_list[idx].cpu().tolist()
+                edge_labels = torch.zeros(num_edges, device=output.device)
+                
+                tour = targets[i, j].cpu().tolist()
+                tour_edges = set()
+                tour_len = len(tour)
                 for k in range(tour_len):
-                    n1, n2 = tour[k].item(), tour[(k + 1) % tour_len].item()
+                    n1, n2 = tour[k], tour[(k + 1) % tour_len]
                     if n1 > n2:
                         n1, n2 = n2, n1
-                    tour_edge_set.add((n1, n2))
-                tour_edges[(i, j)] = tour_edge_set
-        
-        for (node0, node1), (i, j, e_idx) in zip(flattened_edges, flattened_positions):
-            edge_mask[i, j, e_idx] = 1
-            edge_is_in_tour = (node0, node1) in tour_edges[(i, j)]
-            edge_labels[i, j, e_idx] = 1.0 if edge_is_in_tour else 0.0
-        
-        weights = torch.ones_like(edge_labels)
-        weights[edge_labels == 0] = 0.1
-        weights[edge_mask == 0] = 0.0
-        
-        losses = (self.bce(output, edge_labels) * weights).sum(dim=-1) / targets.shape[-1]
+                    tour_edges.add((n1, n2))
+                
+                sorted_edges = [(min(reversed_node_map[edge[0]][-1], reversed_node_map[edge[1]][-1]),
+                                 max(reversed_node_map[edge[0]][-1], reversed_node_map[edge[1]][-1]))
+                                for edge in edges]
+                
+                for e_idx, (node0, node1) in enumerate(sorted_edges):
+                    edge_labels[e_idx] = 1.0 if (node0, node1) in tour_edges else 0.0
+                
+                weights = torch.ones_like(edge_labels)
+                weights[edge_labels == 0] = 1
+                
+                loss = (self.bce(output[i, j, :num_edges], edge_labels) * weights).sum() / num_nodes
+                losses[i, j] = loss
+                idx += 1
         
         return losses
         
@@ -127,7 +114,7 @@ def train(priordataloader_class_or_get_batch: prior.PriorDataLoader | callable, 
                                eval_pos_seq_len_sampler=eval_pos_seq_len_sampler,
                                seq_len_maximum=seq_len,
                                device=device,
-                               num_processes=32,
+                               num_processes=8,
                                **extra_prior_kwargs_dict)
 
     test_batch: prior.Batch = dl.get_test_batch()
@@ -143,8 +130,6 @@ def train(priordataloader_class_or_get_batch: prior.PriorDataLoader | callable, 
         n_out = criterion.weight.shape[0]
     else:
         n_out = 1
-
-    #border_decoder = None if border_decoder is None else border_decoder(emsize, criterion.num_bars + 1).to(device)
 
     if continue_model:
         model = continue_model
@@ -198,7 +183,6 @@ def train(priordataloader_class_or_get_batch: prior.PriorDataLoader | callable, 
     else:
         dl.model = model
 
-
     # learning rate
     if lr is None:
         lr = get_openai_lr(model)
@@ -220,13 +204,14 @@ def train(priordataloader_class_or_get_batch: prior.PriorDataLoader | callable, 
         ignore_steps = 0
         before_get_batch = time.time()
         assert len(dl) % aggregate_k_gradients == 0, 'Please set the number of steps per epoch s.t. `aggregate_k_gradients` divides it.'
-        tqdm_iter = tqdm(range(len(dl)), desc='Training Epoch') if rank==0 and progress_bar else None # , disable=not verbose
+        tqdm_iter = tqdm(range(len(dl)), desc='Training Epoch') if rank==0 and progress_bar else None
 
         for batch, full_data in enumerate(dl):
             data = (full_data.style.to(device) if full_data.style is not None else None, full_data.x.to(device), full_data.y.to(device))
             targets = full_data.target_y.to(device)
             single_eval_pos = full_data.single_eval_pos
-
+            candidate_info = getattr(full_data, 'candidate_info', None)  # Extract candidate_info from batch
+            
             def get_metrics():
                 return total_loss / steps_per_epoch, (
                         total_positional_losses / total_positional_losses_recorded).tolist(), \
@@ -245,21 +230,26 @@ def train(priordataloader_class_or_get_batch: prior.PriorDataLoader | callable, 
                     metrics_to_log = {}
                     with autocast(device.split(':')[0], enabled=scaler is not None):
                         output, edge_info = model(tuple(e.to(device) if torch.is_tensor(e) else e for e in data),
-                                    single_eval_pos=single_eval_pos, only_return_standard_out=False)
+                                    single_eval_pos=single_eval_pos, only_return_standard_out=False, candidate_info=candidate_info)
                         
                         forward_time = time.time() - before_forward
+                        before_loss = time.time()
 
                         if single_eval_pos is not None:
                             targets = targets[single_eval_pos:]
-
+                    
                         losses = criterion(output, targets, edge_info)
                         losses = losses.view(-1, output.shape[1]) 
                                                                   
                         loss, nan_share = utils.torch_nanmean(losses.mean(0), return_nanshare=True)
                         loss_scaled = loss / aggregate_k_gradients
+                        loss_time = time.time() - before_loss
 
                     if scaler: loss_scaled = scaler.scale(loss_scaled)
+
                     loss_scaled.backward()
+                    
+                    loss_backward_time = time.time() - before_loss
 
                     if batch % aggregate_k_gradients == aggregate_k_gradients - 1:
                         if scaler: scaler.unscale_(optimizer)
@@ -292,7 +282,6 @@ def train(priordataloader_class_or_get_batch: prior.PriorDataLoader | callable, 
                     print(e)
                     raise(e)
 
-            #total_loss, total_positional_losses, time_to_get_batch, forward_time, step_time, nan_share, ignore_share = get_metrics()
             if tqdm_iter:
                 tqdm_iter.set_postfix({'data_time': time_to_get_batch, 'step_time': step_time, 'mean_loss': total_loss / (batch+1)})
 
@@ -327,7 +316,6 @@ def train(priordataloader_class_or_get_batch: prior.PriorDataLoader | callable, 
                     f'| end of epoch {epoch:3d} | time: {(time.time() - epoch_start_time):5.2f}s | mean loss {total_loss:5.2f} | '
                     f"pos losses {','.join([f'{l:5.2f}' for l in total_positional_losses])}, lr {scheduler.get_last_lr()[0]}"
                     f' data time {time_to_get_batch:5.2f} step time {step_time:5.2f}'
-                    f' forward time {forward_time:5.2f}' 
                     f' nan share {nan_share:5.2f} ignore share (for classification tasks) {ignore_share:5.4f}'
                     + (f'val score {val_score}' if val_score is not None else ''))
                 print('-' * 89)
@@ -376,6 +364,8 @@ def train_tsp(
     warmup_epochs=2,
     num_nodes_range=(10, 20),
     gpu_device=None,
+    max_candidates=15,
+    priordataloader_class=None,
     **extra_args
 ):
     """
@@ -397,6 +387,8 @@ def train_tsp(
         warmup_epochs: Number of warmup epochs for learning rate
         num_nodes_range: Range of nodes in TSP instances (min, max)
         gpu_device: Device to use for computation (defaults to cuda if available)
+        max_candidates: Maximum number of candidates per node for LKH3
+        priordataloader_class: Custom dataloader class (defaults to TSPDataLoader)
         **extra_args: Additional arguments for train function
         
     Returns:
@@ -404,6 +396,12 @@ def train_tsp(
     """
     device = gpu_device if gpu_device else ('cuda:0' if torch.cuda.is_available() else 'cpu')
     print(f"Training TSP model on {device} with {emsize} embedding size")
+    
+    # Use provided dataloader class or default to TSPDataLoader
+    if priordataloader_class is None:
+        priordataloader_class = TSPDataLoader
+    
+    print(f"Using dataloader: {priordataloader_class.__name__}")
     
     # Create single_eval_pos sampler
     single_eval_pos_sampler = get_uniform_single_eval_pos_sampler(seq_len, min_len=3)
@@ -414,9 +412,20 @@ def train_tsp(
     # Create the custom TSP criterion
     tsp_criterion = TSPAttentionCriterion()
     
+    # Prepare extra_prior_kwargs_dict
+    default_kwargs = {
+        'num_nodes_range': num_nodes_range,
+        'max_candidates': max_candidates
+    }
+    
+    # Merge with any additional kwargs passed in
+    if 'extra_prior_kwargs_dict' in extra_args:
+        default_kwargs.update(extra_args['extra_prior_kwargs_dict'])
+        extra_args = {k: v for k, v in extra_args.items() if k != 'extra_prior_kwargs_dict'}
+    
     # Use train() function with the custom components
     result = train(
-        priordataloader_class_or_get_batch=TSPDataLoader,
+        priordataloader_class_or_get_batch=priordataloader_class,
         criterion=tsp_criterion,
         encoder_generator=tsp_graph_encoder_generator,
         y_encoder_generator=lambda num_features, emsize: tsp_tour_encoder_generator(num_features, emsize, max_nodes=max(num_nodes_range)),
@@ -432,7 +441,7 @@ def train_tsp(
         lr=lr,
         weight_decay=weight_decay,
         warmup_epochs=warmup_epochs,
-        extra_prior_kwargs_dict={'num_nodes_range': num_nodes_range},
+        extra_prior_kwargs_dict=default_kwargs,
         single_eval_pos_gen=single_eval_pos_sampler,
         gpu_device=device,
         **extra_args

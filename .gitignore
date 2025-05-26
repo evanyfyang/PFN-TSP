@@ -166,3 +166,6 @@ saved_models/
 torch_sampling/
 models_diff/
 *.out
+*.pkl
+pfns/priors/LKH
+pfns/priors/lkh3_temp

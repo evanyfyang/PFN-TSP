@@ -1,5 +1,5 @@
 from abc import ABCMeta, abstractmethod
-from typing import Set, Optional
+from typing import Set, Optional, List
 from dataclasses import dataclass, fields
 import torch
 from torch.utils.data import DataLoader
@@ -26,7 +26,9 @@ class Batch:
     style_hyperparameter_values: Optional[torch.Tensor] = None
     single_eval_pos: Optional[torch.Tensor] = None
     causal_model_dag: Optional[object] = None
-    mean_prediction: Optional[bool] = None  # this controls whether to do mean prediction in bar_distribution for nonmyopic BO
+    mean_prediction: Optional[bool] = None  # controls whether to do mean prediction in bar_distribution for nonmyopic BO
+    ortools_solution: Optional[torch.Tensor] = None  # OR-Tools TSP solution using complete graph
+    candidate_info: Optional[List] = None  # LKH3 candidate set information
 
     def other_filled_attributes(self, set_of_attributes: Set[str] = frozenset(('x', 'y', 'target_y'))):
         return [f.name for f in fields(self)
@@ -48,6 +50,8 @@ def safe_merge_batches_in_batch_dim(*batches, ignore_attributes=[]):
         'y': lambda ys: torch.cat(ys, 1),
         'target_y': lambda target_ys: torch.cat(target_ys, 1),
         'style': lambda styles: torch.cat(styles, 0),
+        'ortools_solution': lambda solutions: torch.cat(solutions, 1),
+        'candidate_info': lambda candidate_infos: sum(candidate_infos, []),
     }
     assert all(f in merge_funcs for f in not_none_fields), f'Unknown fields encountered in `safe_merge_batches_in_batch_dim`.'
     return Batch(**{f: merge_funcs[f]([getattr(batch, f) for batch in batches]) for f in not_none_fields})

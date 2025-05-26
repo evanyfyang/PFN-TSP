@@ -157,7 +157,7 @@ def train(priordataloader_class_or_get_batch: prior.PriorDataLoader | callable, 
         ignore_steps = 0
         before_get_batch = time.time()
         assert len(dl) % aggregate_k_gradients == 0, 'Please set the number of steps per epoch s.t. `aggregate_k_gradients` divides it.'
-        tqdm_iter = tqdm(range(len(dl)), desc='Training Epoch') if rank==0 and progress_bar else None # , disable=not verbose
+        tqdm_iter = tqdm(range(len(dl)), desc='Training Epoch') if rank==0 and progress_bar else None
 
         for batch, full_data in enumerate(dl):
             data = (full_data.style.to(device) if full_data.style is not None else None, full_data.x.to(device), full_data.y.to(device))
@@ -273,7 +273,6 @@ def train(priordataloader_class_or_get_batch: prior.PriorDataLoader | callable, 
                     print(e)
                     raise(e)
 
-            #total_loss, total_positional_losses, time_to_get_batch, forward_time, step_time, nan_share, ignore_share = get_metrics()
             if tqdm_iter:
                 tqdm_iter.set_postfix({'data_time': time_to_get_batch, 'step_time': step_time, 'mean_loss': total_loss / (batch+1)})
 
