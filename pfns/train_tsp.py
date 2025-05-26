@@ -30,7 +30,7 @@ class TSPAttentionCriterion(nn.Module):
         super().__init__()
         self.bce = nn.BCEWithLogitsLoss(reduction='none')
 
-    def forward(self, output, targets, edge_info):
+    def forward(self, output, targets, edge_info, single_eval_pos):
         edge_index_list, node_offset_map, edge_counts = edge_info
         seq_len, batch_size, num_nodes = targets.shape
         
@@ -38,9 +38,9 @@ class TSPAttentionCriterion(nn.Module):
         
         reversed_node_map = {value: key for key, value in node_offset_map.items()}
         
-        idx = 0
         for i in range(seq_len):
             for j in range(batch_size):
+                idx = (single_eval_pos + i)*batch_size + j
                 num_edges = edge_counts[idx]
                 edges = edge_index_list[idx].cpu().tolist()
                 edge_labels = torch.zeros(num_edges, device=output.device)
@@ -59,14 +59,23 @@ class TSPAttentionCriterion(nn.Module):
                                 for edge in edges]
                 
                 for e_idx, (node0, node1) in enumerate(sorted_edges):
-                    edge_labels[e_idx] = 1.0 if (node0, node1) in tour_edges else 0.0
+                    if node0 > node1:
+                        edge_labels[e_idx] = -1
+                    elif (node0, node1) in tour_edges:
+                        edge_labels[e_idx] = 1.0
+                    else:
+                        edge_labels[e_idx] = 0.0                    
                 
                 weights = torch.ones_like(edge_labels)
                 weights[edge_labels == 0] = 1
+                weights[edge_labels == -1] = 0
+
+                for e_idx in range(len(edge_labels)):
+                    if edge_labels[e_idx] == -1:
+                        edge_labels[e_idx] = 0
                 
                 loss = (self.bce(output[i, j, :num_edges], edge_labels) * weights).sum() / num_nodes
                 losses[i, j] = loss
-                idx += 1
         
         return losses
         
@@ -238,7 +247,7 @@ def train(priordataloader_class_or_get_batch: prior.PriorDataLoader | callable, 
                         if single_eval_pos is not None:
                             targets = targets[single_eval_pos:]
                     
-                        losses = criterion(output, targets, edge_info)
+                        losses = criterion(output, targets, edge_info, single_eval_pos)
                         losses = losses.view(-1, output.shape[1]) 
                                                                   
                         loss, nan_share = utils.torch_nanmean(losses.mean(0), return_nanshare=True)
@@ -361,7 +370,7 @@ def train_tsp(
     seq_len=20, 
     lr=None, 
     weight_decay=0.0, 
-    warmup_epochs=2,
+    warmup_epochs=1,
     num_nodes_range=(10, 20),
     gpu_device=None,
     max_candidates=15,
