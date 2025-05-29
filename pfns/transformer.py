@@ -263,15 +263,14 @@ class TransformerModel(nn.Module):
             edge_embs_padded = torch.zeros(seq_eval_len * batch_size, max_edges, edge_emb.size(-1), device=edge_emb.device)
             valid_edges_mask = torch.zeros(seq_eval_len * batch_size, max_edges, dtype=torch.bool, device=edge_emb.device)
             
-            idx = 0
             for pos in range(single_eval_pos, x_src.shape[0]):
                 pos_idx = pos - single_eval_pos
                 for b in range(batch_size):
                     flat_idx = pos_idx * batch_size + b
+                    idx = pos * batch_size + b
                     num_edges = edge_counts[idx]
                     edge_embs_padded[flat_idx, :num_edges] = edge_emb_list[idx]
                     valid_edges_mask[flat_idx, :num_edges] = True
-                    idx += 1
             
             orig_shape = edge_embs_padded.shape
             flat_embs = edge_embs_padded.reshape(-1, edge_emb.size(-1))

@@ -54,26 +54,20 @@ class TSPAttentionCriterion(nn.Module):
                         n1, n2 = n2, n1
                     tour_edges.add((n1, n2))
                 
-                sorted_edges = [(min(reversed_node_map[edge[0]][-1], reversed_node_map[edge[1]][-1]),
-                                 max(reversed_node_map[edge[0]][-1], reversed_node_map[edge[1]][-1]))
-                                for edge in edges]
-                
-                for e_idx, (node0, node1) in enumerate(sorted_edges):
-                    if node0 > node1:
-                        edge_labels[e_idx] = -1
-                    elif (node0, node1) in tour_edges:
-                        edge_labels[e_idx] = 1.0
-                    else:
-                        edge_labels[e_idx] = 0.0                    
-                
-                weights = torch.ones_like(edge_labels)
-                weights[edge_labels == 0] = 1
-                weights[edge_labels == -1] = 0
+                # sorted_edges = [(min(reversed_node_map[edge[0]][-1], reversed_node_map[edge[1]][-1]),
+                #                  max(reversed_node_map[edge[0]][-1], reversed_node_map[edge[1]][-1]))
+                #                 for edge in edges]
+                weights = torch.zeros_like(edge_labels)
 
-                for e_idx in range(len(edge_labels)):
-                    if edge_labels[e_idx] == -1:
-                        edge_labels[e_idx] = 0
-                
+                for e_idx, (node0, node1) in enumerate(edges):
+                    u, v = reversed_node_map[node0][-1], reversed_node_map[node1][-1]
+                    if (u,v) in tour_edges:
+                        edge_labels[e_idx] = 1.0 
+                        weights[e_idx] = 1.0
+                    else:
+                        edge_labels[e_idx] = 0.0
+                        weights[e_idx] = 0.2 if u < v else 0.0
+
                 loss = (self.bce(output[i, j, :num_edges], edge_labels) * weights).sum() / num_nodes
                 losses[i, j] = loss
         
@@ -370,7 +364,7 @@ def train_tsp(
     seq_len=20, 
     lr=None, 
     weight_decay=0.0, 
-    warmup_epochs=1,
+    warmup_epochs=0,
     num_nodes_range=(10, 20),
     gpu_device=None,
     max_candidates=15,

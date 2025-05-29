@@ -122,7 +122,7 @@ echo ""
 
 export CUDA_VISIBLE_DEVICES=$GPU
 
-python scripts/train_and_evaluate_tsp.py \
+python -m pdb scripts/train_and_evaluate_tsp.py \
     --training_mode offline \
     --dataset_path "$DATASET_PATH" \
     --emsize $EMSIZE \

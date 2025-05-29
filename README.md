@@ -1,6 +1,17 @@
 # PFNs
 
-This work follows the PFNs project. 
+This work follows the PFNs project.
+
+## Update0526
+- First compile the LKH3 executable file from its source code and then copy it to the `pfns/priors` directory.
+- run `pip install elkai` to install the elkai package.(This might be deleted in the future, so I did not add it to the pyproject.toml.)
+- If you want to use offline training:
+  - run `python scripts/generate_tsp_dataset.py --mode generate --min_nodes 51 --max_nodes 60 --dataset_name TSP41_50_2560 --num_processes 8 --instances_per_size 2560` to generate the data, dataset name is `{dataset_name}_complete.pkl`. Should be mentioned that the instances_per_size should be k*batch_size*test_size, k is the number of how many steps you want for one size of instances. For example, if you want to train the model for 8 steps with each instance size and batch_size is 32 with test_size is 10, then instances_per_size should be 8*32*10=2560.
+  - run `python scripts/generate_tsp_dataset.py --mode merge --merge_datasets TSP41_50_2560_complete.pkl TSP31_40_2560_complete.pkl --merge_name TSP_31_50_2560` to merge some existed datasets.
+  - run ` bash scripts/train_tsp_offline.sh -d /local-scratchg/yifan/2025/PFNs/pfns/datasets/tsp/TSP11_20_2560_complete.pkl -s 11 -l 20 -g 5 -e 10` to train the model, in which the `-d` is the path of the dataset, `-s` is the minimum number of nodes, `-l` is the maximum number of nodes, `-g` is the GPU id, `-e` is the number of epochs.
+- If you still want to use online training like before, you can use the original scripts in the PFNs project.
+- Testing of both online and offline training is the same.
+ 
 
 ## Installation
 

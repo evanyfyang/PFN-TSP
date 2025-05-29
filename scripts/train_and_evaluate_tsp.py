@@ -31,7 +31,7 @@ def parse_args():
     parser.add_argument('--epochs', type=int, default=5, help='Number of training epochs')
     parser.add_argument('--steps_per_epoch', type=int, default=100, help='Steps per epoch (ignored for offline mode)')
     parser.add_argument('--batch_size', type=int, default=32, help='Batch size')
-    parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
+    parser.add_argument('--lr', type=float, default=1e-3, help='Learning rate')
     parser.add_argument('--min_nodes', type=int, default=10, help='Minimum number of nodes in TSP')
     parser.add_argument('--max_nodes', type=int, default=20, help='Maximum number of nodes in TSP')
     parser.add_argument('--max_candidates', type=int, default=15, help='Maximum number of candidates per node for LKH3')
@@ -191,11 +191,12 @@ def predict_tsp_with_pfn(model, coords, solution, device='cuda', decoding_strate
                 if u_info[0] == seq_len-1 and v_info[0] == seq_len-1:
                     u_node = u_info[2]
                     v_node = v_info[2]
-                    
-                    prob = edge_values_np[i]
-                    
-                    adj_list[u_node].append((v_node, prob))
-                    adj_list[v_node].append((u_node, prob))
+
+                    if u_node < v_node:
+                        prob = edge_values_np[i]
+                        
+                        adj_list[u_node].append((v_node, prob))
+                        adj_list[v_node].append((u_node, prob))
         
         # Use appropriate decoding strategy
         if decoding_strategy == 'greedy':
