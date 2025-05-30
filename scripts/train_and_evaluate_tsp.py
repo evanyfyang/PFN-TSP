@@ -242,26 +242,26 @@ def generate_test_instances_with_ortools(num_instances, num_nodes_range, max_can
     
     # Get a batch of data
     
-    test_instances = []
+    test_instances_gen = []
     ortools_solutions = []
     ortools_times = []
     # Extract coordinates and solutions
     for i in range(test_instances): 
         batch = next(iter(dataloader))
-        coords = batch.x[:, i, :].cpu().numpy()
-        solution = batch.target_y[:, i].cpu().numpy()
+        coords = batch.x[:, 0, :].cpu().numpy()
+        solution = batch.target_y[:, 0].cpu().numpy()
         
         # Use the OR-Tools solution
-        ortools_solution = batch.ortools_solution[:, i].cpu().numpy()
+        ortools_solution = batch.ortools_solution[:, 0].cpu().numpy()
 
-        test_instances.append(coords)
+        test_instances_gen.append(coords)
         ortools_solutions.append(ortools_solution)
         # Approximate OR-Tools time per instance
-        ortools_times.append(batch.ortools_solve_time[i])
+        ortools_times.append(batch.ortools_solve_time[-1])
     
     print(f"Average OR-Tools processing time: {np.mean(ortools_times):.4f} seconds")
     
-    return test_instances, ortools_solutions, ortools_times
+    return test_instances_gen, ortools_solutions, ortools_times
 
 def plot_tour(coords, tour, title, ax=None):
     if ax is None:

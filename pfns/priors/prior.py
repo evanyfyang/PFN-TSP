@@ -29,6 +29,7 @@ class Batch:
     mean_prediction: Optional[bool] = None  # controls whether to do mean prediction in bar_distribution for nonmyopic BO
     ortools_solution: Optional[torch.Tensor] = None  # OR-Tools TSP solution using complete graph
     candidate_info: Optional[List] = None  # LKH3 candidate set information
+    ortools_solve_time: Optional[List] = None  # OR-Tools solve time
 
     def other_filled_attributes(self, set_of_attributes: Set[str] = frozenset(('x', 'y', 'target_y'))):
         return [f.name for f in fields(self)

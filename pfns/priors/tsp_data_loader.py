@@ -53,13 +53,13 @@ def solve_tsp_static(coords: np.ndarray) -> list:
         if len(tour) > num_nodes:
             tour = tour[:-1]
             
-        return tour
+        return tour, None
     except Exception as e:
         print(f"Error solving TSP with elkai: {e}")
-        return list(range(num_nodes))
+        return list(range(num_nodes)), None
 
 
-def solve_tsp_ortools(coords: np.ndarray) -> list:
+def solve_tsp_ortools(coords: np.ndarray) -> tuple:
     """
     Solve TSP using Google OR-Tools with metaheuristic, running for 5 seconds.
     
@@ -105,9 +105,10 @@ def solve_tsp_ortools(coords: np.ndarray) -> list:
         routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH)
     search_parameters.time_limit.seconds = 5  # 5 second time limit
     
+    start_time = time.time()
     # Solve the problem
     solution = routing.SolveWithParameters(search_parameters)
-    
+    ortools_solve_time = time.time() - start_time
     # Get the solution
     if solution:
         tour = []
@@ -115,10 +116,10 @@ def solve_tsp_ortools(coords: np.ndarray) -> list:
         while not routing.IsEnd(index):
             tour.append(manager.IndexToNode(index))
             index = solution.Value(routing.NextVar(index))
-        return tour
+        return tour, ortools_solve_time
     else:
         # Fall back to a simple tour if OR-Tools fails
-        return list(range(num_nodes))
+        return list(range(num_nodes)), None
 
 
 def solve_tsp_lkh3(coords: np.ndarray, max_candidates: int = 5, alpha: float = None) -> tuple:
@@ -259,7 +260,7 @@ class TSPDataLoader(PriorDataLoader):
             
             # Generate a batch of TSP graphs using seq_len_maximum as the number of graphs
             if self.include_ortools:
-                x, y, candidate_info, ortools_solution = self._generate_batch(current_num_nodes, self.seq_len_maximum, include_ortools=True)
+                x, y, candidate_info, ortools_solution, ortools_solve_time = self._generate_batch(current_num_nodes, self.seq_len_maximum, include_ortools=True)
             else:
                 x, y, candidate_info = self._generate_batch(current_num_nodes, self.seq_len_maximum, include_ortools=False)
             
@@ -270,7 +271,7 @@ class TSPDataLoader(PriorDataLoader):
             # Yield the batch
             if self.include_ortools:
                 yield Batch(x=x, y=y, target_y=y, ortools_solution=ortools_solution, 
-                           candidate_info=candidate_info, style=None, single_eval_pos=single_eval_pos)
+                           candidate_info=candidate_info, style=None, single_eval_pos=single_eval_pos, ortools_solve_time=ortools_solve_time)
             else:
                 yield Batch(x=x, y=y, target_y=y, candidate_info=candidate_info, 
                            style=None, single_eval_pos=single_eval_pos)
@@ -286,8 +287,21 @@ class TSPDataLoader(PriorDataLoader):
     def _solve_tsp_parallel(self, coords_list, solver_func=solve_tsp_static):
         """Solve multiple TSP instances in parallel"""
         with mp.Pool(processes=self.num_processes) as pool:
-            tours = pool.map(solver_func, coords_list)
-        return tours
+            results = pool.map(solver_func, coords_list)
+        
+        # Handle different return formats
+        if solver_func == solve_tsp_ortools:
+            # solve_tsp_ortools returns (tour, solve_time) tuples
+            tours = [result[0] for result in results]
+            solve_times = [result[1] for result in results]
+            return tours, solve_times
+        else:
+            # Other solvers return (tour, None) or just tour
+            if isinstance(results[0], tuple):
+                tours = [result[0] for result in results]
+                return tours, None
+            else:
+                return results, None
     
     def _solve_tsp_lkh3_parallel(self, coords_list):
         """Solve multiple TSP instances in parallel using LKH3"""
@@ -324,16 +338,10 @@ class TSPDataLoader(PriorDataLoader):
         solve_time = time.time() - start_time
         
         # Solve using OR-Tools if requested
-        start_time = time.time()
-        ortools_solve_time = 0
         ortools_tours = None
         if include_ortools:
-            start_time = time.time()
-            ortools_tours = self._solve_tsp_parallel(flat_coords, solver_func=solve_tsp_ortools)
-            ortools_time = time.time() - start_time
-            print(f"OR-Tools solve time: {ortools_time:.2f}s for {len(flat_coords)} instances")
-
-        ortools_solve_time = time.time() - start_time
+            ortools_tours, ortools_solve_time = self._solve_tsp_parallel(flat_coords, solver_func=solve_tsp_ortools)
+            print(f"OR-Tools solve time: {sum(ortools_solve_time):.2f}s for {len(flat_coords)} instances")
         
         # Unflatten the results
         tours_set = []
