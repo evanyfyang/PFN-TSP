@@ -35,7 +35,7 @@ def parse_args():
     parser.add_argument('--min_nodes', type=int, default=10, help='Minimum number of nodes in TSP')
     parser.add_argument('--max_nodes', type=int, default=20, help='Maximum number of nodes in TSP')
     parser.add_argument('--max_candidates', type=int, default=15, help='Maximum number of candidates per node for LKH3')
-    parser.add_argument('--test_size', type=int, default=10, help='Number of test instances')
+    parser.add_argument('--test_size', type=int, default=10, help='Number of seq len')
     parser.add_argument('--save_dir', type=str, default='./saved_models', help='Directory to save models')
     parser.add_argument('--cuda_device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu', help='Device')
     parser.add_argument('--train', action='store_true', help='Whether to train the model (otherwise just test)')
@@ -43,6 +43,7 @@ def parse_args():
     parser.add_argument('--decoding_strategy', type=str, default='greedy', 
                         choices=['greedy', 'beam_search', 'mcmc', 'greedy_all', 'beam_search_all'], 
                         help='Decoding strategy for TSP')
+    parser.add_argument('--test_instances', type=int, default=20, help='Number of test instances')
     
     # Add online/offline training mode arguments
     parser.add_argument('--training_mode', type=str, default='online', choices=['online', 'offline'],
@@ -220,7 +221,7 @@ def predict_tsp_with_pfn(model, coords, solution, device='cuda', decoding_strate
     
     return tour, total_distance
 
-def generate_test_instances_with_ortools(num_instances, num_nodes_range, max_candidates=15, device='cpu'):
+def generate_test_instances_with_ortools(num_instances, num_nodes_range, max_candidates=15, device='cpu', test_instances=20):
     """Generate test instances and their corresponding OR-Tools solutions using TSPDataLoader"""
     
     def dummy_sampler():
@@ -239,28 +240,24 @@ def generate_test_instances_with_ortools(num_instances, num_nodes_range, max_can
         max_candidates=max_candidates
     )
     
-    # Measure OR-Tools solving time
-    start_time = time.time()
     # Get a batch of data
-    batch = next(iter(dataloader))
-    ortools_time = time.time() - start_time
     
     test_instances = []
     ortools_solutions = []
     ortools_times = []
-    
     # Extract coordinates and solutions
-    for i in range(batch.x.shape[1]): 
+    for i in range(test_instances): 
+        batch = next(iter(dataloader))
         coords = batch.x[:, i, :].cpu().numpy()
         solution = batch.target_y[:, i].cpu().numpy()
         
         # Use the OR-Tools solution
         ortools_solution = batch.ortools_solution[:, i].cpu().numpy()
-        
+
         test_instances.append(coords)
         ortools_solutions.append(ortools_solution)
         # Approximate OR-Tools time per instance
-        ortools_times.append(ortools_time / batch.x.shape[1])
+        ortools_times.append(batch.ortools_solve_time[i])
     
     print(f"Average OR-Tools processing time: {np.mean(ortools_times):.4f} seconds")
     
@@ -412,7 +409,8 @@ def main():
         num_instances=args.test_size,
         num_nodes_range=(args.min_nodes, args.max_nodes),
         max_candidates=args.max_candidates,
-        device=args.cuda_device
+        device=args.cuda_device,
+        test_instances=args.test_instances
     )
     
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")

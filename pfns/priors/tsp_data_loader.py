@@ -324,12 +324,16 @@ class TSPDataLoader(PriorDataLoader):
         solve_time = time.time() - start_time
         
         # Solve using OR-Tools if requested
+        start_time = time.time()
+        ortools_solve_time = 0
         ortools_tours = None
         if include_ortools:
             start_time = time.time()
             ortools_tours = self._solve_tsp_parallel(flat_coords, solver_func=solve_tsp_ortools)
             ortools_time = time.time() - start_time
             print(f"OR-Tools solve time: {ortools_time:.2f}s for {len(flat_coords)} instances")
+
+        ortools_solve_time = time.time() - start_time
         
         # Unflatten the results
         tours_set = []
@@ -349,7 +353,7 @@ class TSPDataLoader(PriorDataLoader):
             idx += len(coords_batch)
         
         if include_ortools:
-            return tours_set, candidates_set, ortools_tours_set, solve_time
+            return tours_set, candidates_set, ortools_tours_set, solve_time, ortools_solve_time
         else:
             return tours_set, candidates_set, solve_time
     
@@ -382,7 +386,7 @@ class TSPDataLoader(PriorDataLoader):
         
         # Solve all TSP instances in parallel, optionally including OR-Tools solutions
         if include_ortools:
-            tours_set, candidates_set, ortools_tours_set, solve_time = self._process_batch_set(coords_set, include_ortools=True)
+            tours_set, candidates_set, ortools_tours_set, solve_time, ortools_solve_time = self._process_batch_set(coords_set, include_ortools=True)
             
             # Create tensor for OR-Tools solutions
             ortools_solution = torch.zeros(num_graphs, self.batch_size, num_nodes, dtype=torch.long)
@@ -442,7 +446,7 @@ class TSPDataLoader(PriorDataLoader):
             print("=" * 30 + "\n")
         
         if include_ortools:
-            return x, y, candidate_info_flat, ortools_solution
+            return x, y, candidate_info_flat, ortools_solution, ortools_solve_time
         else:
             return x, y, candidate_info_flat
 
