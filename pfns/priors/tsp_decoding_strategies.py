@@ -33,6 +33,106 @@ def greedy_decode(adj_list, num_nodes):
     
     return tour
 
+def greedy_edge_decode(adj_list, num_nodes):
+    """
+    Edge-based greedy decoding strategy using union-find and degree counting.
+    """
+    class UnionFind:
+        def __init__(self, n):
+            self.parent = list(range(n))
+            self.rank = [0] * n
+            self.components = n
+        
+        def find(self, x):
+            if self.parent[x] != x:
+                self.parent[x] = self.find(self.parent[x])
+            return self.parent[x]
+        
+        def union(self, x, y):
+            px, py = self.find(x), self.find(y)
+            if px == py:
+                return False
+            
+            if self.rank[px] < self.rank[py]:
+                px, py = py, px
+            self.parent[py] = px
+            if self.rank[px] == self.rank[py]:
+                self.rank[px] += 1
+            self.components -= 1
+            return True
+        
+        def connected(self, x, y):
+            return self.find(x) == self.find(y)
+    
+    edges = []
+    for node in range(num_nodes):
+        for neighbor, prob in adj_list[node]:
+            if node < neighbor:
+                edges.append((prob, node, neighbor))
+    
+    edges.sort(reverse=True)
+    
+    uf = UnionFind(num_nodes)
+    degree = [0] * num_nodes
+    selected_edges = []
+    
+    for prob, u, v in edges:
+        if degree[u] >= 2 or degree[v] >= 2:
+            continue
+        
+        if uf.connected(u, v) and len(selected_edges) < num_nodes - 1:
+            continue
+        
+        selected_edges.append((u, v))
+        degree[u] += 1
+        degree[v] += 1
+        uf.union(u, v)
+        
+        if len(selected_edges) == num_nodes:
+            break
+    
+    if len(selected_edges) < num_nodes:
+        endpoints = [i for i in range(num_nodes) if degree[i] == 1]
+        
+        if len(endpoints) == 2:
+            u, v = endpoints
+            selected_edges.append((u, v))
+        else:
+            return greedy_decode(adj_list, num_nodes)
+    
+    def edges_to_tour(edges, num_nodes):
+        graph = {i: [] for i in range(num_nodes)}
+        for u, v in edges:
+            graph[u].append(v)
+            graph[v].append(u)
+        
+        tour = [0]
+        visited = {0}
+        current = 0
+        
+        while len(tour) < num_nodes:
+            next_node = None
+            for neighbor in graph[current]:
+                if neighbor not in visited:
+                    next_node = neighbor
+                    break
+            
+            if next_node is None:
+                break
+            
+            tour.append(next_node)
+            visited.add(next_node)
+            current = next_node
+        
+        return tour
+    
+    tour = edges_to_tour(selected_edges, num_nodes)
+    
+    if len(tour) < num_nodes:
+        return greedy_decode(adj_list, num_nodes)
+    
+    return tour
+
 def greedy_all_decode(adj_list, num_nodes):
     """
     Try greedy decoding starting from each node and select the best path.

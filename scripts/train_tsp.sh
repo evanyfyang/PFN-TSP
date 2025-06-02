@@ -31,8 +31,8 @@ export CUDA_VISIBLE_DEVICES=$GPU
 
 python scripts/train_and_evaluate_tsp.py \
     --training_mode online \
-    --emsize 256 \
-    --nhid 256 \
+    --emsize 128 \
+    --nhid 128 \
     --nlayers 3 \
     --nhead 8 \
     --dropout 0.1 \

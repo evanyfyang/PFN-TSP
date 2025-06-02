@@ -169,3 +169,4 @@ models_diff/
 *.pkl
 pfns/priors/LKH
 pfns/priors/lkh3_temp
+/edge_prediction_results

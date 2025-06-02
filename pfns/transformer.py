@@ -10,7 +10,58 @@ from .layer import TransformerEncoderLayer, _get_activation_fn
 from .utils import SeqBN, bool_mask_to_att_mask
 import time
 
-
+# Attention-based pooling for edge embeddings
+class GATPooling(nn.Module):
+    def __init__(self, hidden_size, dropout=0.1):
+        super().__init__()
+        self.hidden_size = hidden_size
+        
+        # Linear transformation for attention features
+        self.attention_linear = nn.Linear(hidden_size, hidden_size)
+        
+        # Compute scalar attention scores
+        self.score_linear = nn.Linear(hidden_size, 1)
+        
+        self.dropout = nn.Dropout(dropout)
+        
+    def forward(self, x, batch_indices):
+        """
+        x: [num_edges, hidden_size] - edge embeddings
+        batch_indices: [num_edges] - batch assignment for each edge
+        """
+        if x.size(0) == 0:
+            return torch.zeros(1, self.hidden_size, device=x.device)
+            
+        batch_size = batch_indices.max().item() + 1 if batch_indices.numel() > 0 else 1
+        
+        # Compute attention features
+        attention_features = self.attention_linear(x)  # [num_edges, hidden_size]
+        attention_features = torch.relu(attention_features)
+        attention_features = self.dropout(attention_features)
+        
+        # Compute scalar attention scores for each edge
+        attention_scores = self.score_linear(attention_features)  # [num_edges, 1]
+        attention_scores = attention_scores.squeeze(-1)  # [num_edges]
+        
+        # Compute softmax weights and weighted sum for each batch separately
+        pooled_outputs = []
+        for b in range(batch_size):
+            batch_mask = (batch_indices == b)
+            if batch_mask.sum() > 0:
+                # Get current batch edge embeddings and attention scores
+                batch_embeddings = x[batch_mask]  # [batch_edges, hidden_size]
+                batch_scores = attention_scores[batch_mask]  # [batch_edges]
+                
+                # Compute softmax weights within batch
+                batch_weights = F.softmax(batch_scores, dim=0)  # [batch_edges]
+                
+                # Weighted sum to get graph representation
+                pooled = torch.sum(batch_embeddings * batch_weights.unsqueeze(-1), dim=0)  # [hidden_size]
+                pooled_outputs.append(pooled)
+            else:
+                pooled_outputs.append(torch.zeros(self.hidden_size, device=x.device))
+        
+        return torch.stack(pooled_outputs, dim=0)  # [batch_size, hidden_size]
 
 class TransformerModel(nn.Module):
     def __init__(self, encoder, ninp, nhead, nhid, nlayers, dropout=0.0, style_encoder=None, y_encoder=None,
@@ -30,6 +81,12 @@ class TransformerModel(nn.Module):
         self.y_encoder = y_encoder
         self.pos_encoder = pos_encoder
         self.return_all_outputs = return_all_outputs
+
+        # Add GAT pooling for edge embeddings
+        self.gat_pooling = GATPooling(hidden_size=ninp, dropout=dropout)
+        self.edge_concat_mlp = nn.Sequential(nn.Linear(2*ninp, ninp), nn.GELU(), nn.Linear(ninp, 1))
+
+        self.edge_hard_mlp = nn.Sequential(nn.Linear(ninp, ninp), nn.GELU(), nn.Linear(ninp, 1))
 
         def make_decoder_dict(decoder_description_dict):
             if decoder_description_dict is None or len(decoder_description_dict) == 0:
@@ -170,7 +227,10 @@ class TransformerModel(nn.Module):
 
         # Pass candidate_info to encoder if it supports it
         if hasattr(self.encoder, 'forward') and 'candidate_info' in self.encoder.forward.__code__.co_varnames:
-            x_encoder_output = self.encoder(x_src, candidate_info=candidate_info)
+            if 'gat_pooling' in self.encoder.forward.__code__.co_varnames:
+                x_encoder_output = self.encoder(x_src, candidate_info=candidate_info, gat_pooling=self.gat_pooling)
+            else:
+                x_encoder_output = self.encoder(x_src, candidate_info=candidate_info)
         else:
             x_encoder_output = self.encoder(x_src)
 
@@ -195,7 +255,8 @@ class TransformerModel(nn.Module):
                     edge_index=edge_index,
                     batch=batch,
                     position=position_tensor,
-                    node_offset_map=node_offset_map
+                    node_offset_map=node_offset_map,
+                    gat_pooling=self.gat_pooling
                 )
             else:
                 y_encoded = self.y_encoder(y_shape_adjusted)
@@ -276,9 +337,15 @@ class TransformerModel(nn.Module):
             flat_embs = edge_embs_padded.reshape(-1, edge_emb.size(-1))
             processed_embs = self.edge_mlp(flat_embs).reshape(orig_shape)
             output_reshaped = output.reshape(seq_eval_len * batch_size, -1).unsqueeze(1)
-            edge_values_batch = torch.bmm(output_reshaped, processed_embs.transpose(1, 2)).squeeze(1)
-            edge_values_padded = edge_values_batch.reshape(seq_eval_len, batch_size, max_edges)
+
+            # edge_values_batch = torch.bmm(output_reshaped, processed_embs.transpose(1, 2)).squeeze(1)
             
+            # edge_embs_concated = torch.cat([output_reshaped.repeat(1,max_edges,1), processed_embs], dim=-1)
+            # edge_values_batch = self.edge_concat_mlp(edge_embs_concated).squeeze(-1)
+
+            edge_values_batch = self.edge_hard_mlp(output_reshaped.repeat(1,max_edges,1) * processed_embs).squeeze(-1)
+            
+            edge_values_padded = edge_values_batch.reshape(seq_eval_len, batch_size, max_edges)
             edge_values_padded = edge_values_padded * valid_edges_mask.reshape(seq_eval_len, batch_size, max_edges).float()
 
             ret_info = [edge_index_list, node_offset_map, edge_counts]
