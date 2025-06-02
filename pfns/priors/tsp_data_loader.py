@@ -155,6 +155,58 @@ def solve_tsp_lkh3(coords: np.ndarray, max_candidates: int = 5, alpha: float = N
             'mst_parents': {}
         }
 
+#use or-tools to solve tsp, but initial solution is given
+def solve_tsp_static_with_initial_solutions(initial_solution: list, coords: np.ndarray, time_limit = 1):
+    num_nodes = len(coords)
+    distance_matrix = np.zeros((num_nodes+1, num_nodes+1))#add more stop as fake depot for initial solution assignment
+    for i in range(num_nodes):
+        for j in range(num_nodes):
+            if i == j:
+                distance_matrix[i][j] = 0
+            else:
+                distance_matrix[i][j] = np.linalg.norm(coords[i] - coords[j])
+    
+    manager = pywrapcp.RoutingIndexManager(num_nodes+1, 1, num_nodes)#n nodes to be visited + 1 depot. Depot is num_nodes, nodes to be visited is from 0 to num_nodes -1
+    routing = pywrapcp.RoutingModel(manager)
+    
+
+    def distance_callback(from_index, to_index):
+        from_node = manager.IndexToNode(from_index)
+        to_node = manager.IndexToNode(to_index)
+        return int(distance_matrix[from_node][to_node] * 1000)
+        
+    transit_callback_index = routing.RegisterTransitCallback(distance_callback)
+    routing.SetArcCostEvaluatorOfAllVehicles(transit_callback_index)
+
+    search_parameters = pywrapcp.DefaultRoutingSearchParameters()#DO not use OR-tools to generate initial solution
+    search_parameters.first_solution_strategy = (routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC)
+    search_parameters.local_search_metaheuristic = (routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH)
+    search_parameters.time_limit.FromSeconds(time_limit)
+    routing.CloseModelWithParameters(search_parameters)
+    
+    
+
+    # Convert route to indices used by routing model
+    route_indices = [manager.NodeToIndex(node) for node in initial_solution]
+    assignment = routing.ReadAssignmentFromRoutes([route_indices],True)
+    if assignment is None:
+        print("Assignment Fail")
+
+    
+    solution = routing.SolveFromAssignmentWithParameters(assignment,search_parameters)
+    print('objective ===========', solution.ObjectiveValue())
+    
+    
+    if solution:
+        index = routing.Start(0)
+        tour = []
+        while not routing.IsEnd(index):
+            node = manager.IndexToNode(index)
+            tour.append(node)
+            index = solution.Value(routing.NextVar(index))
+        return tour[1:]#need to eliminate fake depot
+    else:
+        return list(range(num_nodes))
 
 def solve_tsp_lkh3_parallel_worker(args):
     """Worker function for parallel LKH3 solving"""
@@ -254,9 +306,19 @@ class TSPDataLoader(PriorDataLoader):
                         style=None, single_eval_pos=single_eval_pos)
 
     def __iter__(self):
-        for _ in range(self.num_steps):
+        #should be train for at least 1 steps / epoch or more
+        assert self.num_steps > 0
+        #problem dimension used for training increase with contant number of step size
+        step = (self.num_nodes_range[1] + 1 - self.num_nodes_range[0]) / (self.num_steps)
+
+        for i in range(self.num_steps):
             # Generate a random number of nodes for the current batch
-            current_num_nodes = np.random.randint(self.num_nodes_range[0], self.num_nodes_range[1] + 1)
+            # current_num_nodes = np.random.randint(self.num_nodes_range[0], self.num_nodes_range[1] + 1)
+
+            # Generate differnet number of nodes for each batch, with the number of nodes increase by constant step
+            current_num_nodes = self.num_nodes_range[0] + int(step * i)
+            print("Generate test batch with size = ", current_num_nodes)
+            
             
             # Generate a batch of TSP graphs using seq_len_maximum as the number of graphs
             if self.include_ortools:
@@ -282,7 +344,8 @@ class TSPDataLoader(PriorDataLoader):
             self.coord_range[0], 
             self.coord_range[1], 
             size=(num_instances, num_nodes, 2)
-        )
+        ) * np.random.uniform(self.num_nodes_range[0], self.num_nodes_range[1])
+    
     
     def _solve_tsp_parallel(self, coords_list, solver_func=solve_tsp_static):
         """Solve multiple TSP instances in parallel"""

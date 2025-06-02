@@ -36,7 +36,7 @@ python scripts/train_and_evaluate_tsp.py \
     --nlayers 3 \
     --nhead 8 \
     --dropout 0.1 \
-    --epochs 10 \
+    --epochs 20 \
     --steps_per_epoch 100 \
     --batch_size 16 \
     --min_nodes $MIN_NODES \
