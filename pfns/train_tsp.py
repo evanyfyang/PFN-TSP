@@ -61,12 +61,12 @@ class TSPAttentionCriterion(nn.Module):
 
                 for e_idx, (node0, node1) in enumerate(edges):
                     u, v = reversed_node_map[node0][-1], reversed_node_map[node1][-1]
-                    if (u,v) in tour_edges:
+                    if ((u,v) in tour_edges) or ((v,u) in tour_edges):
                         edge_labels[e_idx] = 1.0 
                         weights[e_idx] = 1.0
                     else:
                         edge_labels[e_idx] = 0.0
-                        weights[e_idx] = 0.2 if u < v else 0.0
+                        weights[e_idx] = 0.25
 
                 loss = (self.bce(output[i, j, :num_edges], edge_labels) * weights).sum() / num_nodes
                 losses[i, j] = loss
@@ -79,7 +79,7 @@ class Losses():
     ce = lambda num_classes: nn.CrossEntropyLoss(reduction='none', weight=torch.ones(num_classes))
     bce = nn.BCEWithLogitsLoss(reduction='none')
     get_BarDistribution = BarDistribution
-
+    
 class TrainingResult(tp.NamedTuple):
     # the mean loss in the last epoch across dataset sizes (single_eval_pos's)
     total_loss: tp.Optional[float]

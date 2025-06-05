@@ -41,9 +41,9 @@ class TSPGraphEncoder(nn.Module):
         
         # Initialize Args with appropriate parameters for TSP task
         args = Args(
-            emb_depth=3, 
+            emb_depth=6, 
             net_units=emsize, 
-            net_act_fn=torch.nn.ReLU(), 
+            net_act_fn=torch.nn.SiLU(), 
             emb_agg_fn=global_mean_pool,  
             par_depth=3
         )
@@ -52,7 +52,7 @@ class TSPGraphEncoder(nn.Module):
         self.net = Net(args)
     
         
-    def forward(self, x, candidate_info=None):
+    def forward(self, x, candidate_info=None, gat_pooling=None):
         """
         Forward pass through the GNN encoder.
         
@@ -67,6 +67,7 @@ class TSPGraphEncoder(nn.Module):
                 - dimension: Number of nodes
                 - candidates: Dict mapping node_id to list of (neighbor_id, alpha_value) tuples
                 - mst_parents: Dict mapping node_id to parent in MST
+            gat_pooling: Optional GAT pooling module for attention-based aggregation
         
         Returns:
             Dictionary containing:
@@ -155,7 +156,8 @@ class TSPGraphEncoder(nn.Module):
             edge_index=edge_index, 
             edge_attr=edge_attr, 
             batch=batch_tensor,
-            position=position_tensor  # Pass position information
+            position=position_tensor,  # Pass position information
+            gat_pooling=gat_pooling
         )
             
         # Return both node embeddings and edge information in a dictionary
@@ -183,7 +185,7 @@ class TSPTourEncoder(nn.Module):
         
         # self.backup_embedding = nn.Embedding(max_nodes, emsize)
         
-    def forward(self, y, edge_emb=None, edge_index=None, batch=None, position=None, node_offset_map=None):
+    def forward(self, y, edge_emb=None, edge_index=None, batch=None, position=None, node_offset_map=None, gat_pooling=None):
         """
         Forward pass through the tour encoder.
         
@@ -194,6 +196,7 @@ class TSPTourEncoder(nn.Module):
             batch: Optional tensor of batch indices for each node
             position: Optional tensor of position indices for each node
             node_offset_map: Optional dictionary mapping (pos, batch, node) to global node indices
+            gat_pooling: Optional GAT pooling module for attention-based aggregation
             
         Returns:
             Tensor of shape (seq_len, batch, emsize) containing tour embeddings
@@ -209,12 +212,13 @@ class TSPTourEncoder(nn.Module):
             for b in range(batch_size):
                 tour = y[pos, b]  # (num_nodes,)
                 
+                # Create tour edges (including return to start)
                 tour_edges = torch.stack([tour[:-1], tour[1:]], dim=0)  # (2, num_nodes-1)
-                
                 final_edge = torch.tensor([[tour[-1]], [tour[0]]], device=y.device)
                 tour_edges = torch.cat([tour_edges, final_edge], dim=1)  # (2, num_nodes)
                 
-                edge_embs_for_tour = []
+                # Collect all bidirectional edge embeddings for the tour
+                all_tour_edge_embs = []
                 src, dst = edge_index
                 
                 for i in range(tour_edges.shape[1]):
@@ -226,51 +230,27 @@ class TSPTourEncoder(nn.Module):
                             global_src = node_offset_map[(pos, b, src_idx)]
                             global_dst = node_offset_map[(pos, b, dst_idx)]
                             
-                            edge_mask = ((src == global_src) & (dst == global_dst))
-                            if not edge_mask.any():
-                                edge_mask = ((src == global_dst) & (dst == global_src))
-                        else:
-                            edge_mask = torch.zeros_like(src, dtype=torch.bool)
-                    else:
-                        if position is not None and batch is not None:
-                            edge_mask = torch.zeros_like(src, dtype=torch.bool)
+                            # Check both directions and collect all embeddings
+                            edge_mask_1 = ((src == global_src) & (dst == global_dst))
+                            edge_mask_2 = ((src == global_dst) & (dst == global_src))
                             
-                            for e_idx in range(len(src)):
-                                src_node, dst_node = src[e_idx], dst[e_idx]
-                                src_pos = position[src_node].item()
-                                dst_pos = position[dst_node].item()
-                                src_batch = batch[src_node].item()
-                                dst_batch = batch[dst_node].item()
-                                
-                                # Check if this edge connects nodes in the current position and batch
-                                if (src_pos == pos and dst_pos == pos and 
-                                    src_batch == b and dst_batch == b):
-                                    src_local_idx = None
-                                    dst_local_idx = None
-                                    
-                                    for n in range(num_nodes):
-                                        if (pos, b, n) in node_offset_map:
-                                            if node_offset_map[(pos, b, n)] == src_node:
-                                                src_local_idx = n
-                                            if node_offset_map[(pos, b, n)] == dst_node:
-                                                dst_local_idx = n
-                                    
-                                    if ((src_local_idx == src_idx and dst_local_idx == dst_idx) or
-                                        (src_local_idx == dst_idx and dst_local_idx == src_idx)):
-                                        edge_mask[e_idx] = True
-                                        break
-                        else:
-                            edge_mask = torch.zeros_like(src, dtype=torch.bool)
+                            if edge_mask_1.any():
+                                all_tour_edge_embs.append(edge_emb[torch.where(edge_mask_1)[0][0]])
+                            if edge_mask_2.any():
+                                all_tour_edge_embs.append(edge_emb[torch.where(edge_mask_2)[0][0]])
+                
+                # Perform single unified pooling on all collected edge embeddings
+                if len(all_tour_edge_embs) > 0:
+                    tour_edge_embs = torch.stack(all_tour_edge_embs, dim=0)  # [total_edges, emsize]
                     
-                    if edge_mask.any():
-                        edge_idx = torch.where(edge_mask)[0][0]
-                        edge_embs_for_tour.append(edge_emb[edge_idx])
+                    # Use GAT pooling for unified tour embedding if available
+                    if gat_pooling is not None:
+                        batch_indices = torch.zeros(tour_edge_embs.size(0), dtype=torch.long, device=y.device)
+                        tour_embedding = gat_pooling(tour_edge_embs, batch_indices)[0]
                     else:
-                        edge_embs_for_tour.append(torch.zeros(self.emsize, device=y.device))
-                
-                tour_edge_embs = torch.stack(edge_embs_for_tour, dim=0)  # (num_nodes, emsize)
-                
-                tour_embedding = tour_edge_embs.mean(dim=0)
+                        tour_embedding = tour_edge_embs.mean(dim=0)
+                else:
+                    tour_embedding = torch.zeros(self.emsize, device=y.device)
                 
                 tour_embeddings[pos, b, :] = tour_embedding
         

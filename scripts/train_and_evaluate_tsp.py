@@ -18,7 +18,7 @@ from pfns.train_tsp import train_tsp
 from pfns.priors.tsp_data_loader import TSPDataLoader, solve_tsp_static_with_initial_solutions
 from pfns.priors.tsp_offline_data_loader import TSPOfflineDataLoader
 from pfns.priors.prior import Batch
-from pfns.priors.tsp_decoding_strategies import greedy_decode, greedy_all_decode, beam_search_decode, beam_search_all_decode, mcmc_decode
+from pfns.priors.tsp_decoding_strategies import *
 
 def parse_args():
     """Parse command line arguments"""
@@ -41,7 +41,7 @@ def parse_args():
     parser.add_argument('--train', action='store_true', help='Whether to train the model (otherwise just test)')
     parser.add_argument('--model_path', type=str, default=None, help='Path to pretrained model for testing')
     parser.add_argument('--decoding_strategy', type=str, default='greedy', 
-                        choices=['greedy', 'beam_search', 'mcmc', 'greedy_all', 'beam_search_all'], 
+                        choices=['greedy', 'beam_search', 'mcmc', 'greedy_all', 'beam_search_all', 'greedy_edge'], 
                         help='Decoding strategy for TSP')
     parser.add_argument('--test_instances', type=int, default=20, help='Number of test instances')
     
@@ -165,6 +165,9 @@ def predict_tsp_with_pfn(model, coords, solution, device='cuda', decoding_strate
         # Build adjacency list
         adj_list = [[] for _ in range(num_nodes)]
         
+        # First pass: collect all edge probabilities
+        edge_probs = {}  # (u, v) -> list of probabilities
+        
         # Only consider valid edges (according to edge_counts for the last problem)
         valid_edge_count = edge_counts[-1]
         
@@ -192,12 +195,22 @@ def predict_tsp_with_pfn(model, coords, solution, device='cuda', decoding_strate
                 if u_info[0] == seq_len-1 and v_info[0] == seq_len-1:
                     u_node = u_info[2]
                     v_node = v_info[2]
-
-                    if u_node < v_node:
-                        prob = edge_values_np[i]
-                        
-                        adj_list[u_node].append((v_node, prob))
-                        adj_list[v_node].append((u_node, prob))
+                    
+                    # Store edge probability for both directions
+                    prob = edge_values_np[i]
+                    edge_key = (min(u_node, v_node), max(u_node, v_node))
+                    
+                    if edge_key not in edge_probs:
+                        edge_probs[edge_key] = []
+                    edge_probs[edge_key].append(prob)
+        
+        # Second pass: build adjacency list with averaged probabilities
+        for (u_node, v_node), probs in edge_probs.items():
+            # Calculate mean probability for both directions
+            avg_prob = np.mean(probs)
+            
+            adj_list[u_node].append((v_node, avg_prob))
+            adj_list[v_node].append((u_node, avg_prob))
         
         # Use appropriate decoding strategy
         if decoding_strategy == 'greedy':
@@ -210,6 +223,8 @@ def predict_tsp_with_pfn(model, coords, solution, device='cuda', decoding_strate
             tour = beam_search_all_decode(adj_list, num_nodes)
         elif decoding_strategy == 'mcmc':
             tour = mcmc_decode(adj_list, node_map, edge_index_np, edge_values_np, num_nodes)
+        elif decoding_strategy == 'greedy_edge':
+            tour = greedy_edge_decode(adj_list, num_nodes)
         else:
             raise ValueError(f"Unknown decoding strategy: {decoding_strategy}")
     
@@ -245,6 +260,7 @@ def generate_test_instances_with_ortools(num_instances, num_nodes_range, max_can
     test_instances_gen = []
     ortools_solutions = []
     ortools_times = []
+    lkh_solutions = []
     # Extract coordinates and solutions
     for i in range(test_instances): 
         batch = next(iter(dataloader))
@@ -256,12 +272,13 @@ def generate_test_instances_with_ortools(num_instances, num_nodes_range, max_can
 
         test_instances_gen.append(coords)
         ortools_solutions.append(ortools_solution)
+        lkh_solutions.append(solution)
         # Approximate OR-Tools time per instance
         ortools_times.append(batch.ortools_solve_time[-1])
     
     print(f"Average OR-Tools processing time: {np.mean(ortools_times):.4f} seconds")
     
-    return test_instances_gen, ortools_solutions, ortools_times
+    return test_instances_gen, lkh_solutions, ortools_solutions, ortools_times
 
 def plot_tour(coords, tour, title, ax=None):
     if ax is None:
@@ -292,7 +309,7 @@ def calculate_tour_length(coords, tour):
     total_distance += np.linalg.norm(coords[tour[-1]] - coords[tour[0]])
     return total_distance
 
-def evaluate_and_compare(model, test_instances, ortools_solutions, ortools_times, device='cuda', decoding_strategy='greedy', save_plot=True, plot_path='tsp_comparison.png'):
+def evaluate_and_compare(model, test_instances, lkh_solutions, ortools_solutions, ortools_times, device='cuda', decoding_strategy='greedy', save_plot=True, plot_path='tsp_comparison.png'):
     """Evaluate model and compare with OR-Tools"""
     print(f"Starting model evaluation with {decoding_strategy} decoding strategy...")
     
@@ -305,7 +322,7 @@ def evaluate_and_compare(model, test_instances, ortools_solutions, ortools_times
     
     viz_idx = np.random.randint(0, len(test_instances))
     
-    for i, (coords, ortools_solution) in enumerate(zip(test_instances, ortools_solutions)):
+    for i, (coords, ortools_solution, lkh_solution) in enumerate(zip(test_instances, ortools_solutions, lkh_solutions)):
         print(f"Processing test instance {i+1}/{len(test_instances)}...")
         
         # Use the last TSP instance for comparison
@@ -314,7 +331,7 @@ def evaluate_and_compare(model, test_instances, ortools_solutions, ortools_times
         ortools_distances.append(ortools_distance)
         
         start_time = time.time()
-        pfn_tour, pfn_distance = predict_tsp_with_pfn(model, coords, ortools_solution, device=device, decoding_strategy=decoding_strategy)
+        pfn_tour, pfn_distance = predict_tsp_with_pfn(model, coords, lkh_solution, device=device, decoding_strategy=decoding_strategy)
         pfn_time = time.time() - start_time
         pfn_distances.append(pfn_distance)
         processing_times_pfn.append(pfn_time)
@@ -430,7 +447,7 @@ def main():
         model_path = args.model_path
     
     print(f"Generating test instances...")
-    test_instances, ortools_solutions, ortools_times = generate_test_instances_with_ortools(
+    test_instances, lkh_solutions, ortools_solutions, ortools_times = generate_test_instances_with_ortools(
         num_instances=args.test_size,
         num_nodes_range=(args.min_nodes, args.max_nodes),
         max_candidates=args.max_candidates,
@@ -444,6 +461,7 @@ def main():
     results = evaluate_and_compare(
         model=model,
         test_instances=test_instances, 
+        lkh_solutions=lkh_solutions,
         ortools_solutions=ortools_solutions,
         ortools_times=ortools_times,
         device=args.cuda_device, 
