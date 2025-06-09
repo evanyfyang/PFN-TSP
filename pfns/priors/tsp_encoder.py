@@ -28,16 +28,18 @@ class TSPGraphEncoder(nn.Module):
     - Creates a complete graph for each TSP instance 
     - Produces node embeddings and edge information for downstream processing
     """
-    def __init__(self, num_features, emsize):
+    def __init__(self, num_features, emsize, max_candidates=50):
         """
         Parameters:
             num_features: Number of features (2 for 2D coordinates)
             emsize: Size of output embeddings
+            max_candidates: Maximum number of candidate edges per node
         """
         super().__init__()
         # Store dimensions
         self.num_features = num_features
         self.emsize = emsize
+        self.max_candidates = max_candidates
         
         # Initialize Args with appropriate parameters for TSP task
         args = Args(
@@ -99,23 +101,61 @@ class TSPGraphEncoder(nn.Module):
                     # Calculate the index in the flattened candidate_info list
                     candidate_idx = pos * batch_size + b
                     if candidate_idx < len(candidate_info) and candidate_info[candidate_idx] is not None:
-                        # Use LKH3 candidate edges
+                        # Use LKH3 candidate edges and supplement with nearest neighbors if needed
                         edges = set()
                         cand_info = candidate_info[candidate_idx]
                         
-                        # Extract edges from candidate information
+                        # Determine target edges per node
+                        target_edges_per_node = min(self.max_candidates, num_nodes - 1) if num_nodes > 1 else 0
+                        
+                        # Build adjacency list from LKH3 candidates
+                        node_candidates = {}
                         for node_id, candidates in cand_info['candidates'].items():
-                            # Convert from 1-based to 0-based indexing
-                            src_node = node_id - 1
+                            src_node = node_id - 1  # Convert from 1-based to 0-based indexing
+                            if src_node not in node_candidates:
+                                node_candidates[src_node] = []
+                            
                             for neighbor_id, alpha_value in candidates:
                                 dst_node = neighbor_id - 1
-                                # Add undirected edge (both directions)
-                                edges.add((min(src_node, dst_node), max(src_node, dst_node)))
+                                if dst_node != src_node:  # Avoid self-loops
+                                    node_candidates[src_node].append((dst_node, alpha_value))
+                        
+                        # Calculate distance matrix for finding nearest neighbors if needed
+                        dist_matrix = torch.cdist(coords, coords, p=2)  # Euclidean distance
+                        
+                        # For each node, select up to target_edges_per_node edges
+                        for node in range(num_nodes):
+                            # Get LKH3 candidates for this node
+                            lkh3_candidates = node_candidates.get(node, [])
+                            
+                            # Sort LKH3 candidates by alpha value (or distance if alpha is same)
+                            lkh3_candidates.sort(key=lambda x: x[1])  # Sort by alpha value
+                            
+                            # Take up to target_edges_per_node from LKH3 candidates
+                            selected_neighbors = []
+                            for neighbor, alpha in lkh3_candidates[:target_edges_per_node]:
+                                selected_neighbors.append(neighbor)
+                                edges.add((min(node, neighbor), max(node, neighbor)))
+                            
+                            # If we need more edges for this node, add nearest neighbors
+                            if len(selected_neighbors) < target_edges_per_node:
+                                # Get distances from this node to all others
+                                distances = dist_matrix[node]
+                                # Sort by distance (excluding self and already selected)
+                                sorted_indices = torch.argsort(distances)
+                                
+                                for neighbor_idx in sorted_indices:
+                                    neighbor = neighbor_idx.item()
+                                    if (neighbor != node and 
+                                        neighbor not in selected_neighbors and 
+                                        len(selected_neighbors) < target_edges_per_node):
+                                        selected_neighbors.append(neighbor)
+                                        edges.add((min(node, neighbor), max(node, neighbor)))
                         
                         if len(edges) > 0:
                             edge_index = torch.tensor(list(edges), dtype=torch.long, device=x.device).t().contiguous()
                         else:
-                            # Fallback to complete graph if no candidates
+                            # Fallback to complete graph if no edges could be created
                             adj_matrix = torch.triu(torch.ones(num_nodes, num_nodes, device=x.device), diagonal=1)
                             edge_index = g_utils.dense_to_sparse(adj_matrix)[0]
                     else:
@@ -160,6 +200,46 @@ class TSPGraphEncoder(nn.Module):
             gat_pooling=gat_pooling
         )
             
+        # Print debug information for the first batch
+        if not hasattr(self, '_first_batch_processed'):
+            self._first_batch_processed = True
+            print(f"\n=== TSPGraphEncoder Debug Info ===")
+            print(f"Input shape: {x.shape}")
+            
+            # Calculate actual edge statistics
+            if candidate_info is not None:
+                total_candidate_edges = 0
+                total_final_edges = 0
+                valid_instances = 0
+                
+                for i, info in enumerate(candidate_info):
+                    if info and 'candidates' in info:
+                        candidate_edges = sum(len(candidates) for candidates in info['candidates'].values())
+                        total_candidate_edges += candidate_edges
+                        
+                        # Calculate final edges from edge_counts
+                        if i < len(edge_counts):
+                            # edge_counts includes both directions, so divide by 2
+                            final_edges = edge_counts[i] // 2
+                            total_final_edges += final_edges
+                        
+                        valid_instances += 1
+                
+                if valid_instances > 0:
+                    avg_candidate_edges = total_candidate_edges / valid_instances
+                    avg_final_edges = total_final_edges / valid_instances
+                    print(f"Average candidate edges per graph: {avg_candidate_edges:.1f}")
+                    print(f"Average final edges per graph (after supplementing): {avg_final_edges:.1f}")
+                    print(f"Target edges per node: {min(self.max_candidates, num_nodes - 1)}")
+                    print(f"Average edges per node (final): {avg_final_edges / num_nodes:.1f}")
+                else:
+                    print("No valid candidate information found")
+            else:
+                print("No candidate_info provided - using complete graphs")
+            
+            print(f"Number of nodes per instance: {num_nodes}")
+            print("=" * 40 + "\n")
+        
         # Return both node embeddings and edge information in a dictionary
         return {
             'node_embeddings': graph_emb,
@@ -208,6 +288,25 @@ class TSPTourEncoder(nn.Module):
         
         tour_embeddings = torch.zeros(seq_len, batch_size, self.emsize, device=y.device)
         
+        # Extract edge indices
+        src, dst = edge_index
+        
+        # Create a more efficient edge lookup using sorting
+        # Combine src and dst into a single tensor for efficient lookup
+        edge_pairs = torch.stack([src, dst], dim=1)  # [num_edges, 2]
+        edge_pairs_flipped = torch.stack([dst, src], dim=1)  # [num_edges, 2] (reverse direction)
+        
+        # Create combined edge tensor with both directions
+        all_edge_pairs = torch.cat([edge_pairs, edge_pairs_flipped], dim=0)  # [2*num_edges, 2]
+        all_edge_indices = torch.cat([torch.arange(len(src), device=y.device), 
+                                     torch.arange(len(src), device=y.device)], dim=0)  # [2*num_edges]
+        
+        # Sort edges for efficient lookup
+        edge_keys = all_edge_pairs[:, 0] * (src.max() + 1) + all_edge_pairs[:, 1]
+        sorted_indices = torch.argsort(edge_keys)
+        sorted_edge_keys = edge_keys[sorted_indices]
+        sorted_edge_indices = all_edge_indices[sorted_indices]
+        
         for pos in range(seq_len):
             for b in range(batch_size):
                 tour = y[pos, b]  # (num_nodes,)
@@ -217,9 +316,9 @@ class TSPTourEncoder(nn.Module):
                 final_edge = torch.tensor([[tour[-1]], [tour[0]]], device=y.device)
                 tour_edges = torch.cat([tour_edges, final_edge], dim=1)  # (2, num_nodes)
                 
-                # Collect all bidirectional edge embeddings for the tour
-                all_tour_edge_embs = []
-                src, dst = edge_index
+                # Convert tour edges to global indices and create lookup keys
+                tour_edge_keys = []
+                valid_tour_edges = []
                 
                 for i in range(tour_edges.shape[1]):
                     src_idx = tour_edges[0, i].item()
@@ -230,25 +329,37 @@ class TSPTourEncoder(nn.Module):
                             global_src = node_offset_map[(pos, b, src_idx)]
                             global_dst = node_offset_map[(pos, b, dst_idx)]
                             
-                            # Check both directions and collect all embeddings
-                            edge_mask_1 = ((src == global_src) & (dst == global_dst))
-                            edge_mask_2 = ((src == global_dst) & (dst == global_src))
-                            
-                            if edge_mask_1.any():
-                                all_tour_edge_embs.append(edge_emb[torch.where(edge_mask_1)[0][0]])
-                            if edge_mask_2.any():
-                                all_tour_edge_embs.append(edge_emb[torch.where(edge_mask_2)[0][0]])
+                            # Create lookup key
+                            key = global_src * (src.max() + 1) + global_dst
+                            tour_edge_keys.append(key)
+                            valid_tour_edges.append((global_src, global_dst))
                 
-                # Perform single unified pooling on all collected edge embeddings
-                if len(all_tour_edge_embs) > 0:
-                    tour_edge_embs = torch.stack(all_tour_edge_embs, dim=0)  # [total_edges, emsize]
+                if tour_edge_keys:
+                    # Convert to tensor for efficient lookup
+                    tour_keys_tensor = torch.tensor(tour_edge_keys, device=y.device)
                     
-                    # Use GAT pooling for unified tour embedding if available
-                    if gat_pooling is not None:
-                        batch_indices = torch.zeros(tour_edge_embs.size(0), dtype=torch.long, device=y.device)
-                        tour_embedding = gat_pooling(tour_edge_embs, batch_indices)[0]
+                    # Use searchsorted for efficient lookup
+                    indices = torch.searchsorted(sorted_edge_keys, tour_keys_tensor)
+                    
+                    # Collect valid edge embeddings
+                    all_tour_edge_embs = []
+                    for i, idx in enumerate(indices):
+                        if idx < len(sorted_edge_keys) and sorted_edge_keys[idx] == tour_keys_tensor[i]:
+                            edge_idx = sorted_edge_indices[idx]
+                            all_tour_edge_embs.append(edge_emb[edge_idx])
+                
+                    # Perform single unified pooling on all collected edge embeddings
+                    if len(all_tour_edge_embs) > 0:
+                        tour_edge_embs = torch.stack(all_tour_edge_embs, dim=0)  # [total_edges, emsize]
+                        
+                        # Use GAT pooling for unified tour embedding if available
+                        if gat_pooling is not None:
+                            batch_indices = torch.zeros(tour_edge_embs.size(0), dtype=torch.long, device=y.device)
+                            tour_embedding = gat_pooling(tour_edge_embs, batch_indices)[0]
+                        else:
+                            tour_embedding = tour_edge_embs.mean(dim=0)
                     else:
-                        tour_embedding = tour_edge_embs.mean(dim=0)
+                        tour_embedding = torch.zeros(self.emsize, device=y.device)
                 else:
                     tour_embedding = torch.zeros(self.emsize, device=y.device)
                 
@@ -257,9 +368,9 @@ class TSPTourEncoder(nn.Module):
         return tour_embeddings
 
 
-def tsp_graph_encoder_generator(num_features, emsize):
+def tsp_graph_encoder_generator(num_features, emsize, max_candidates=50):
     """Generator function for TSP graph encoder"""
-    return TSPGraphEncoder(num_features, emsize)
+    return TSPGraphEncoder(num_features, emsize, max_candidates)
 
 def tsp_tour_encoder_generator(num_features, emsize, max_nodes=100):
     """Generator function for TSP tour encoder"""

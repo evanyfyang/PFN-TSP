@@ -44,6 +44,8 @@ def parse_args():
                         choices=['greedy', 'beam_search', 'mcmc', 'greedy_all', 'beam_search_all', 'greedy_edge'], 
                         help='Decoding strategy for TSP')
     parser.add_argument('--test_instances', type=int, default=20, help='Number of test instances')
+    parser.add_argument('--use_complete_graph', action='store_true', 
+                        help='Use complete graph instead of candidate edges (for comparison)')
     
     # Add online/offline training mode arguments
     parser.add_argument('--training_mode', type=str, default='online', choices=['online', 'offline'],
@@ -117,7 +119,7 @@ def train_tsp_model(args):
     
     return result.model.to(args.cuda_device), model_save_path
 
-def predict_tsp_with_pfn(model, coords, solution, device='cuda', decoding_strategy='greedy'):
+def predict_tsp_with_pfn(model, coords, solution, candidate_info=None, use_complete_graph=False, device='cuda', decoding_strategy='greedy'):
     """Predict TSP tour using the trained PFN model"""
     model.eval()
     
@@ -140,7 +142,13 @@ def predict_tsp_with_pfn(model, coords, solution, device='cuda', decoding_strate
     
     # Step by step prediction
     with torch.no_grad():
-        outputs = model((None, x, y), single_eval_pos=seq_len-1)
+        # Pass candidate_info to the model only if not using complete graph
+        if use_complete_graph:
+            print("Using complete graph for inference...")
+            outputs = model((None, x, y), single_eval_pos=seq_len-1, candidate_info=None)
+        else:
+            print("Using candidate edges for inference...")
+            outputs = model((None, x, y), single_eval_pos=seq_len-1, candidate_info=candidate_info)
         edge_values_padded, edge_info = outputs
         
         # New edge_info format is [edge_index_list, node_offset_map, edge_counts]
@@ -261,6 +269,8 @@ def generate_test_instances_with_ortools(num_instances, num_nodes_range, max_can
     ortools_solutions = []
     ortools_times = []
     lkh_solutions = []
+    candidate_infos = []  # Add candidate_info storage
+    
     # Extract coordinates and solutions
     for i in range(test_instances): 
         batch = next(iter(dataloader))
@@ -273,12 +283,13 @@ def generate_test_instances_with_ortools(num_instances, num_nodes_range, max_can
         test_instances_gen.append(coords)
         ortools_solutions.append(ortools_solution)
         lkh_solutions.append(solution)
+        candidate_infos.append(batch.candidate_info)  # Save candidate_info
         # Approximate OR-Tools time per instance
         ortools_times.append(batch.ortools_solve_time[-1])
     
     print(f"Average OR-Tools processing time: {np.mean(ortools_times):.4f} seconds")
     
-    return test_instances_gen, lkh_solutions, ortools_solutions, ortools_times
+    return test_instances_gen, lkh_solutions, ortools_solutions, ortools_times, candidate_infos
 
 def plot_tour(coords, tour, title, ax=None):
     if ax is None:
@@ -309,9 +320,13 @@ def calculate_tour_length(coords, tour):
     total_distance += np.linalg.norm(coords[tour[-1]] - coords[tour[0]])
     return total_distance
 
-def evaluate_and_compare(model, test_instances, lkh_solutions, ortools_solutions, ortools_times, device='cuda', decoding_strategy='greedy', save_plot=True, plot_path='tsp_comparison.png'):
+def evaluate_and_compare(model, test_instances, lkh_solutions, ortools_solutions, ortools_times, candidate_infos, use_complete_graph=False, device='cuda', decoding_strategy='greedy', save_plot=True, plot_path='tsp_comparison.png'):
     """Evaluate model and compare with OR-Tools"""
     print(f"Starting model evaluation with {decoding_strategy} decoding strategy...")
+    if use_complete_graph:
+        print("Using complete graph for all instances")
+    else:
+        print("Using candidate edges for all instances")
     
     pfn_distances = []
     ortools_distances = []
@@ -320,7 +335,7 @@ def evaluate_and_compare(model, test_instances, lkh_solutions, ortools_solutions
     
     viz_idx = np.random.randint(0, len(test_instances))
     
-    for i, (coords, ortools_solution, lkh_solution) in enumerate(zip(test_instances, ortools_solutions, lkh_solutions)):
+    for i, (coords, ortools_solution, lkh_solution, candidate_info) in enumerate(zip(test_instances, ortools_solutions, lkh_solutions, candidate_infos)):
         print(f"Processing test instance {i+1}/{len(test_instances)}...")
         
         # Use the last TSP instance for comparison
@@ -329,7 +344,13 @@ def evaluate_and_compare(model, test_instances, lkh_solutions, ortools_solutions
         ortools_distances.append(ortools_distance)
         
         start_time = time.time()
-        pfn_tour, pfn_distance = predict_tsp_with_pfn(model, coords, lkh_solution, device=device, decoding_strategy=decoding_strategy)
+        pfn_tour, pfn_distance = predict_tsp_with_pfn(
+            model, coords, lkh_solution, 
+            candidate_info=candidate_info, 
+            use_complete_graph=use_complete_graph,
+            device=device, 
+            decoding_strategy=decoding_strategy
+        )
         pfn_time = time.time() - start_time
         pfn_distances.append(pfn_distance)
         processing_times_pfn.append(pfn_time)
@@ -422,7 +443,7 @@ def main():
         model_path = args.model_path
     
     print(f"Generating test instances...")
-    test_instances, lkh_solutions, ortools_solutions, ortools_times = generate_test_instances_with_ortools(
+    test_instances, lkh_solutions, ortools_solutions, ortools_times, candidate_infos = generate_test_instances_with_ortools(
         num_instances=args.test_size,
         num_nodes_range=(args.min_nodes, args.max_nodes),
         max_candidates=args.max_candidates,
@@ -431,7 +452,8 @@ def main():
     )
     
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    plot_path = os.path.join(args.save_dir, f"tsp_comparison_{args.decoding_strategy}_{timestamp}.png")
+    graph_type = "complete" if args.use_complete_graph else "candidate"
+    plot_path = os.path.join(args.save_dir, f"tsp_comparison_{args.decoding_strategy}_{graph_type}_{timestamp}.png")
     
     results = evaluate_and_compare(
         model=model,
@@ -439,12 +461,14 @@ def main():
         lkh_solutions=lkh_solutions,
         ortools_solutions=ortools_solutions,
         ortools_times=ortools_times,
+        candidate_infos=candidate_infos,
+        use_complete_graph=args.use_complete_graph,
         device=args.cuda_device, 
         decoding_strategy=args.decoding_strategy,
         plot_path=plot_path
     )
     
-    results_path = os.path.join(args.save_dir, f"tsp_results_{args.decoding_strategy}_{timestamp}.npz")
+    results_path = os.path.join(args.save_dir, f"tsp_results_{args.decoding_strategy}_{graph_type}_{timestamp}.npz")
     np.savez(results_path, 
              pfn_distances=results['pfn_distances'],
              ortools_distances=results['ortools_distances'],
