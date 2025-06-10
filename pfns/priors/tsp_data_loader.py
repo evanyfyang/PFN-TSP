@@ -156,7 +156,7 @@ def solve_tsp_lkh3(coords: np.ndarray, max_candidates: int = 5, alpha: float = N
         }
 
 #use or-tools to solve tsp, but initial solution is given
-def solve_tsp_static_with_initial_solutions(initial_solution: list, coords: np.ndarray, time_limit = 1):
+def solve_tsp_static_with_or_tools_and_initial_solutions(initial_solution: list, coords: np.ndarray, time_limit = 1):
     num_nodes = len(coords)
     distance_matrix = np.zeros((num_nodes+1, num_nodes+1))#add more stop as fake depot for initial solution assignment
     for i in range(num_nodes):
@@ -194,7 +194,6 @@ def solve_tsp_static_with_initial_solutions(initial_solution: list, coords: np.n
 
     
     solution = routing.SolveFromAssignmentWithParameters(assignment,search_parameters)
-    print('objective ===========', solution.ObjectiveValue())
     
     
     if solution:
@@ -344,7 +343,8 @@ class TSPDataLoader(PriorDataLoader):
             self.coord_range[0], 
             self.coord_range[1], 
             size=(num_instances, num_nodes, 2)
-        ) * np.random.uniform(self.num_nodes_range[0], self.num_nodes_range[1])
+        )
+        #  * np.random.uniform(self.num_nodes_range[0], self.num_nodes_range[1])
     
     
     def _solve_tsp_parallel(self, coords_list, solver_func=solve_tsp_static):

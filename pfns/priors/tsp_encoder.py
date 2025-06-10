@@ -254,6 +254,7 @@ class TSPTourEncoder(nn.Module):
                 
                 tour_embeddings[pos, b, :] = tour_embedding
         
+        
         return tour_embeddings
 
 

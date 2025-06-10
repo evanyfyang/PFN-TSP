@@ -36,13 +36,13 @@ python scripts/train_and_evaluate_tsp.py \
     --nlayers 3 \
     --nhead 8 \
     --dropout 0.1 \
-    --epochs 20 \
-    --steps_per_epoch 100 \
+    --epochs 2 \
+    --steps_per_epoch 2 \
     --batch_size 16 \
     --min_nodes $MIN_NODES \
     --max_nodes $MAX_NODES \
     --max_candidates $MAX_CANDIDATES \
-    --test_size 10 \
+    --test_size 5 \
     --train
 
 echo "Online training completed!" 

@@ -15,7 +15,7 @@ import torch.nn.functional as F
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from pfns.train_tsp import train_tsp
-from pfns.priors.tsp_data_loader import TSPDataLoader, solve_tsp_static_with_initial_solutions
+from pfns.priors.tsp_data_loader import TSPDataLoader, solve_tsp_static_with_or_tools_and_initial_solutions
 from pfns.priors.tsp_offline_data_loader import TSPOfflineDataLoader
 from pfns.priors.prior import Batch
 from pfns.priors.tsp_decoding_strategies import *
@@ -117,7 +117,31 @@ def train_tsp_model(args):
     
     return result.model.to(args.cuda_device), model_save_path
 
-def predict_tsp_with_pfn(model, coords, solution, device='cuda', decoding_strategy='greedy'):
+def get_candidate_info_no_mst(coords, max_candidates=5):#use for decode testing, assume there is only 1 instance to get candidate info.
+    # Step 1: Extract coordinates # instance shape: [num_nodes, 2]
+    num_nodes = coords.shape[0]
+
+    # Ensure we don't request more candidates than are available
+    max_candidates = min(max_candidates, num_nodes - 1)
+
+    # Step 2: Compute full distance matrix
+    from scipy.spatial import distance_matrix
+    dist_matrix = distance_matrix(coords, coords)
+
+    # Step 3: Build candidate set for each node
+    candidates = {}
+    for i in range(num_nodes):
+        distances = [(j, dist_matrix[i, j]) for j in range(num_nodes) if j != i]
+        distances.sort(key=lambda x: x[1])  # sort by distance
+        top_k = distances[:max_candidates]
+
+        candidate_list = [(j + 1, round(d, 4)) for j, d in top_k]  # 1-indexed
+        candidates[i + 1] = candidate_list
+
+    # Return in the correct format
+    return [{"dimension": num_nodes,"candidates": candidates }]
+
+def predict_tsp_with_pfn(model, coords, solution, device='cuda', decoding_strategy='greedy', max_candidates = 5):
     """Predict TSP tour using the trained PFN model"""
     model.eval()
     
@@ -130,16 +154,29 @@ def predict_tsp_with_pfn(model, coords, solution, device='cuda', decoding_strate
     seq_len = len(coords)
     num_nodes = last_coords.shape[0]
     
-    # Create complete x tensor (seq_len, 1, num_nodes, 2)
+    # Create complete x tensor (seq_len, 1, num_nodes, 2), it seems ineffcient to do interference on those dataset we would not use (the first seq_len -1 data), since we only the last instance
     x = torch.zeros(seq_len, 1, num_nodes, 2, dtype=torch.float32, device=device)
     y = torch.zeros(seq_len, 1, num_nodes, dtype=torch.long, device=device)
     
     for i, (coord, sol) in enumerate(zip(coords, solution)):
         x[i, 0] = torch.tensor(coord, dtype=torch.float32, device=device)
         y[i, 0] = torch.tensor(sol, dtype=torch.long, device=device)
-    
+
+    # # Build input tensor - need to include all sequence positions
+    # num_nodes = last_coords.shape[0]
+    # seq_len = 1 #only use the one (the last one instance) for testing
+
+    # # Create complete x tensor (seq_len, 1, num_nodes, 2) for the last one
+    # x = torch.zeros(seq_len, 1, num_nodes, 2, dtype=torch.float32, device=device)
+    # y = torch.zeros(seq_len, 1, num_nodes, dtype=torch.long, device=device)
+
+
+    # x[0, 0] = torch.tensor(last_coords, dtype=torch.float32, device=device)
+    # y[0, 0] = torch.tensor(last_solution, dtype=torch.long, device=device)
+
     # Step by step prediction
     with torch.no_grad():
+        # outputs = model((None, x, y), single_eval_pos=seq_len-1, candidate_info = get_candidate_info_no_mst(last_coords, max_candidates)) #add k-NN to decoding also. 
         outputs = model((None, x, y), single_eval_pos=seq_len-1)
         edge_values_padded, edge_info = outputs
         
@@ -205,13 +242,12 @@ def predict_tsp_with_pfn(model, coords, solution, device='cuda', decoding_strate
                     edge_probs[edge_key].append(prob)
         
         # Second pass: build adjacency list with averaged probabilities
-        for (u_node, v_node), probs in edge_probs.items():
-            # Calculate mean probability for both directions
+        for (u_node, v_node), probs in edge_probs.items():#full matrix
+            # Calculate mean probability for both directions (u->v and v->u)
             avg_prob = np.mean(probs)
             
             adj_list[u_node].append((v_node, avg_prob))
             adj_list[v_node].append((u_node, avg_prob))
-        
         # Use appropriate decoding strategy
         if decoding_strategy == 'greedy':
             tour = greedy_decode(adj_list, num_nodes)
@@ -309,7 +345,7 @@ def calculate_tour_length(coords, tour):
     total_distance += np.linalg.norm(coords[tour[-1]] - coords[tour[0]])
     return total_distance
 
-def evaluate_and_compare(model, test_instances, lkh_solutions, ortools_solutions, ortools_times, device='cuda', decoding_strategy='greedy', save_plot=True, plot_path='tsp_comparison.png'):
+def evaluate_and_compare(model, test_instances, lkh_solutions, ortools_solutions, ortools_times, device='cuda', decoding_strategy='greedy', save_plot=True, plot_path='tsp_comparison.png', max_candidates = 5):
     """Evaluate model and compare with OR-Tools"""
     print(f"Starting model evaluation with {decoding_strategy} decoding strategy...")
     
@@ -331,17 +367,17 @@ def evaluate_and_compare(model, test_instances, lkh_solutions, ortools_solutions
         ortools_distances.append(ortools_distance)
         
         start_time = time.time()
-        pfn_tour, pfn_distance = predict_tsp_with_pfn(model, coords, lkh_solution, device=device, decoding_strategy=decoding_strategy)
+        pfn_tour, pfn_distance = predict_tsp_with_pfn(model, coords, lkh_solution, device=device, decoding_strategy=decoding_strategy, max_candidates = max_candidates)
         pfn_time = time.time() - start_time
         pfn_distances.append(pfn_distance)
         processing_times_pfn.append(pfn_time)
 
         #pure PFN with OR-Tools        
         start_time = time.time()
-        pfn_or_tour, pfn_or_distance = predict_tsp_with_pfn(model, coords, ortools_tour, device=device, decoding_strategy=decoding_strategy)
-        pfn_or_optimized_tour = solve_tsp_static_with_initial_solutions(pfn_or_tour, coords.copy()[-1], time_limit = 4)
+        pfn_or_tour, pfn_or_distance = predict_tsp_with_pfn(model, coords, ortools_tour, device=device, decoding_strategy=decoding_strategy, max_candidates = max_candidates)
+        pfn_or_optimized_tour = solve_tsp_static_with_or_tools_and_initial_solutions(pfn_or_tour, coords.copy()[-1], time_limit = 1)
         pfn_or_processing_time= time.time()- start_time
-        print(pfn_or_distance)
+        
         pfn_or_optimized_tour_length = calculate_tour_length(coords[-1], pfn_or_optimized_tour)
         pfn_or_distances.append(pfn_or_optimized_tour_length)
         processing_times_pfn_or.append(pfn_or_processing_time)
@@ -466,7 +502,8 @@ def main():
         ortools_times=ortools_times,
         device=args.cuda_device, 
         decoding_strategy=args.decoding_strategy,
-        plot_path=plot_path
+        plot_path=plot_path, 
+        max_candidates = args.max_candidates
     )
     
     results_path = os.path.join(args.save_dir, f"tsp_results_{args.decoding_strategy}_{timestamp}.npz")
