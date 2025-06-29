@@ -225,12 +225,25 @@ class TransformerModel(nn.Module):
         if single_eval_pos is None:
             single_eval_pos = x_src.shape[0]
 
-        # Pass candidate_info to encoder if it supports it
+        # Check if encoder supports unified encoding (has use_unified_encoding attribute)
+        encoder_supports_unified = hasattr(self.encoder, 'use_unified_encoding') and self.encoder.use_unified_encoding
+        
+        # Pass candidate_info and y_src to encoder if it supports them
         if hasattr(self.encoder, 'forward') and 'candidate_info' in self.encoder.forward.__code__.co_varnames:
+            encoder_kwargs = {'candidate_info': candidate_info}
+            
+            # Add y parameter if encoder supports unified encoding
+            if encoder_supports_unified and 'y' in self.encoder.forward.__code__.co_varnames:
+                encoder_kwargs['y'] = y_src
+                
             if 'gat_pooling' in self.encoder.forward.__code__.co_varnames:
-                x_encoder_output = self.encoder(x_src, candidate_info=candidate_info, gat_pooling=self.gat_pooling)
-            else:
-                x_encoder_output = self.encoder(x_src, candidate_info=candidate_info)
+                encoder_kwargs['gat_pooling'] = self.gat_pooling
+            
+            # Add single_eval_pos for SharedBasisFiLM mode
+            if 'single_eval_pos' in self.encoder.forward.__code__.co_varnames:
+                encoder_kwargs['single_eval_pos'] = single_eval_pos
+                
+            x_encoder_output = self.encoder(x_src, **encoder_kwargs)
         else:
             x_encoder_output = self.encoder(x_src)
 
@@ -239,13 +252,28 @@ class TransformerModel(nn.Module):
         if isinstance(x_encoder_output, dict) and 'node_embeddings' in x_encoder_output:
             edge_info = x_encoder_output.get('edge_info')
             x_encoded = x_encoder_output['node_embeddings']
+            
+            # Check for direct predictions mode (SharedBasisFiLM)
+            if x_encoder_output.get('direct_predictions', False):
+                # For SharedBasisFiLM mode, encoder has already done edge prediction
+                # Just return the pre-computed edge predictions and edge_info
+                edge_predictions = x_encoder_output.get('edge_predictions')
+                if edge_predictions is not None:
+                    return edge_predictions, edge_info
+                else:
+                    # Fallback if no edge predictions provided
+                    seq_eval_len = x_src.shape[0] - single_eval_pos
+                    batch_size = x_src.shape[1]
+                    dummy_predictions = torch.zeros(seq_eval_len, batch_size, 1, device=x_src.device)
+                    return dummy_predictions, edge_info
         else:
             x_encoded = x_encoder_output
 
         if self.decoder_dict_once is not None:
             x_encoded = torch.cat([x_encoded, self.decoder_dict_once_embeddings.repeat(1, x_encoded.shape[1], 1)], dim=0)
 
-        if y_src is not None and self.y_encoder is not None:
+        # Use y_encoder only if not using unified encoding
+        if y_src is not None and self.y_encoder is not None and not encoder_supports_unified:
             y_shape_adjusted = y_src.unsqueeze(-1) if len(y_src.shape) < len(x_encoded.shape) else y_src
             if edge_info is not None:
                 edge_emb, edge_index, batch, position_tensor, node_offset_map, edge_counts = edge_info
@@ -313,45 +341,123 @@ class TransformerModel(nn.Module):
 
         output = output[out_range_start:out_range_end]
         
-        edge_emb, edge_index, batch, position_tensor, node_offset_map, edge_counts = edge_info
-            
-        if edge_emb is not None and edge_index is not None and batch is not None:
-            edge_emb_list = torch.split(edge_emb, edge_counts, dim=0)
-            edge_index_list = torch.split(edge_index.permute(1, 0), edge_counts, dim=0)
-            seq_eval_len = x_src.shape[0] - single_eval_pos
-            batch_size = x_src.shape[1]
-            max_edges = max(edge_counts)
-            edge_embs_padded = torch.zeros(seq_eval_len * batch_size, max_edges, edge_emb.size(-1), device=edge_emb.device)
-            valid_edges_mask = torch.zeros(seq_eval_len * batch_size, max_edges, dtype=torch.bool, device=edge_emb.device)
-            
-            for pos in range(single_eval_pos, x_src.shape[0]):
-                pos_idx = pos - single_eval_pos
-                for b in range(batch_size):
-                    flat_idx = pos_idx * batch_size + b
-                    idx = pos * batch_size + b
-                    num_edges = edge_counts[idx]
-                    edge_embs_padded[flat_idx, :num_edges] = edge_emb_list[idx]
-                    valid_edges_mask[flat_idx, :num_edges] = True
-            
-            orig_shape = edge_embs_padded.shape
-            flat_embs = edge_embs_padded.reshape(-1, edge_emb.size(-1))
-            processed_embs = self.edge_mlp(flat_embs).reshape(orig_shape)
-            output_reshaped = output.reshape(seq_eval_len * batch_size, -1).unsqueeze(1)
-
-            # edge_values_batch = torch.bmm(output_reshaped, processed_embs.transpose(1, 2)).squeeze(1)
-            
-            # edge_embs_concated = torch.cat([output_reshaped.repeat(1,max_edges,1), processed_embs], dim=-1)
-            # edge_values_batch = self.edge_concat_mlp(edge_embs_concated).squeeze(-1)
-
-            edge_values_batch = self.edge_hard_mlp(output_reshaped.repeat(1,max_edges,1) * processed_embs).squeeze(-1)
-            
-            edge_values_padded = edge_values_batch.reshape(seq_eval_len, batch_size, max_edges)
-            edge_values_padded = edge_values_padded * valid_edges_mask.reshape(seq_eval_len, batch_size, max_edges).float()
-
-            ret_info = [edge_index_list, node_offset_map, edge_counts]
-            return edge_values_padded, tuple(ret_info)
+        # Handle unified dict format with eval_infos
+        eval_infos = edge_info.get('eval_infos', [])
+        if eval_infos:
+            # Use structural edge information to build outputs
+            return self._build_output_from_eval_infos(output, eval_infos, single_eval_pos, x_src)
         else:
+            # No evaluation info available
             return output, None
+
+    def _build_output_from_eval_infos(self, output, eval_infos, single_eval_pos, x_src):
+        """
+        Build output using structural evaluation information from TSPGraphEncoder.
+        This method processes the edge structural information and applies edge prediction MLPs.
+        
+        Args:
+            output: Transformer output [seq_eval_len, batch_size, emsize]
+            eval_infos: List of evaluation info dictionaries from TSPGraphEncoder (structural only)
+            single_eval_pos: Position where evaluation starts
+            x_src: Original input tensor for shape information
+            
+        Returns:
+            edge_predictions: Tensor [seq_eval_len, batch_size, max_edges]
+            edge_info_tuple: Tuple containing edge information for compatibility
+        """
+        seq_eval_len, batch_size, emsize = output.shape
+        
+        # Group eval_infos by position and batch
+        eval_info_dict = {}
+        max_edges = 0
+        
+        for eval_info in eval_infos:
+            pos = eval_info['pos']
+            batch = eval_info['batch']
+            edge_index = eval_info['edge_index']
+            
+            # Calculate position in output tensor
+            if single_eval_pos is not None:
+                output_pos = pos - single_eval_pos
+            else:
+                output_pos = pos
+            
+            if output_pos >= 0 and output_pos < seq_eval_len:
+                if output_pos not in eval_info_dict:
+                    eval_info_dict[output_pos] = {}
+                eval_info_dict[output_pos][batch] = eval_info
+                
+                # Track maximum number of edges
+                num_edges = edge_index.size(1) if edge_index.size(1) > 0 else 0
+                max_edges = max(max_edges, num_edges)
+        
+        # Create output tensors
+        edge_values_padded = torch.zeros(seq_eval_len, batch_size, max_edges, device=output.device)
+        edge_index_list = []
+        edge_counts = []
+        
+        # Process each evaluation position and batch
+        for pos_idx in range(seq_eval_len):
+            for batch_idx in range(batch_size):
+                if pos_idx in eval_info_dict and batch_idx in eval_info_dict[pos_idx]:
+                    eval_info = eval_info_dict[pos_idx][batch_idx]
+                    edge_index = eval_info['edge_index']
+                    num_edges = edge_index.size(1)
+                    
+                    if num_edges > 0:
+                        # Apply edge prediction MLP to the transformer output
+                        transformer_output = output[pos_idx, batch_idx].unsqueeze(0)  # [1, emsize]
+                        
+                        # Create edge embeddings by applying edge MLP to transformer output
+                        # This simulates the edge embedding processing
+                        edge_embs = transformer_output.repeat(num_edges, 1)  # [num_edges, emsize]
+                        processed_embs = self.edge_mlp(edge_embs)  # [num_edges, emsize]
+                        
+                        # Apply edge predictor (similar to the existing logic)
+                        transformer_expanded = transformer_output.repeat(num_edges, 1)  # [num_edges, emsize]
+                        edge_values = self.edge_hard_mlp(transformer_expanded * processed_embs).squeeze(-1)
+                        
+                        # Store edge values (padded)
+                        edge_values_padded[pos_idx, batch_idx, :num_edges] = edge_values
+                        
+                        # Store edge index and count information
+                        edge_index_list.append(edge_index.t())  # Convert to [num_edges, 2] format
+                        edge_counts.append(num_edges)
+                    else:
+                        # No edges for this instance
+                        edge_index_list.append(torch.empty((0, 2), dtype=torch.long, device=output.device))
+                        edge_counts.append(0)
+                else:
+                    # No evaluation info for this position/batch
+                    edge_index_list.append(torch.empty((0, 2), dtype=torch.long, device=output.device))
+                    edge_counts.append(0)
+        
+        # Build proper node_offset_map for loss calculation
+        # The eval_infos should contain the correct node_offset_map from the encoder
+        node_offset_map = {}
+        for eval_info in eval_infos:
+            pos, batch = eval_info['pos'], eval_info['batch']
+            valid_indices = eval_info.get('valid_indices', [])
+            node_offset_info = eval_info.get('node_offset_map', {})
+            
+            # If node_offset_map is available in eval_info, use it directly
+            if node_offset_info:
+                node_offset_map.update(node_offset_info)
+            else:
+                # Fallback: create mapping based on edge indices
+                # This assumes edge_index contains global node indices
+                if valid_indices is not None:
+                    edge_index = eval_info.get('edge_index')
+                    if edge_index is not None and edge_index.size(1) > 0:
+                        # Extract unique global node indices from edges
+                        unique_global_nodes = torch.unique(edge_index).cpu().tolist()
+                        for i, valid_idx in enumerate(valid_indices):
+                            if i < len(unique_global_nodes):
+                                node_offset_map[(pos, batch, valid_idx.item())] = unique_global_nodes[i]
+        
+        ret_info = (edge_index_list, node_offset_map, edge_counts)
+        
+        return edge_values_padded, ret_info
 
     @torch.no_grad()
     def init_from_small_model(self, small_model):
@@ -403,7 +509,6 @@ class TransformerModel(nn.Module):
 
             my_layer.norm1.bias[:small_in_dim] = small_layer.norm1.bias
             my_layer.norm2.bias[:small_in_dim] = small_layer.norm2.bias
-
 
 class TransformerEncoderDiffInit(Module):
     r"""TransformerEncoder is a stack of N encoder layers

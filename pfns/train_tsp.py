@@ -26,53 +26,228 @@ from .priors.tsp_encoder import tsp_graph_encoder_generator, tsp_tour_encoder_ge
 from torch.autograd import profiler
 
 class TSPAttentionCriterion(nn.Module):
-    def __init__(self):
+    """
+    TSP attention criterion that computes edge labels dynamically from targets.
+    Supports configurable loss direction modes while always creating bidirectional edges for GNN.
+    """
+    def __init__(self, loss_direction_mode='both'):
+        """
+        Initialize TSP attention criterion.
+        
+        Args:
+            loss_direction_mode: How to handle edge directions in loss calculation:
+                - 'both': Use both directions (u->v and v->u) for bidirectional learning
+                - 'forward': Use only forward/canonical direction (u->v where u < v)
+        """
         super().__init__()
         self.bce = nn.BCEWithLogitsLoss(reduction='none')
+        self.loss_direction_mode = loss_direction_mode
+        
+        if loss_direction_mode not in ['both', 'forward']:
+            raise ValueError(f"loss_direction_mode must be one of ['both', 'forward'], got {loss_direction_mode}")
 
     def forward(self, output, targets, edge_info, single_eval_pos):
-        edge_index_list, node_offset_map, edge_counts = edge_info
-        seq_len, batch_size, num_nodes = targets.shape
+        """
+        Compute loss for TSP edge prediction by dynamically creating edge labels.
         
+        Args:
+            output: Model predictions [seq_len, batch_size, max_edges]
+            targets: Target tours [seq_len, batch_size, num_nodes] 
+            edge_info: Edge information with structural data in eval_infos (unified dict format)
+            single_eval_pos: Position where evaluation starts
+            
+        Returns:
+            losses: Loss tensor [seq_len, batch_size]
+        """
+        seq_len, batch_size, _ = output.shape
         losses = torch.zeros((seq_len, batch_size), device=output.device)
         
-        reversed_node_map = {value: key for key, value in node_offset_map.items()}
+        # Handle unified dict format with eval_infos
+        eval_infos = edge_info.get('eval_infos', [])
         
-        for i in range(seq_len):
-            for j in range(batch_size):
-                idx = (single_eval_pos + i)*batch_size + j
-                num_edges = edge_counts[idx]
-                edges = edge_index_list[idx].cpu().tolist()
-                edge_labels = torch.zeros(num_edges, device=output.device)
+        if not eval_infos:
+            return losses
+        
+        # Process each evaluation instance and dynamically compute labels
+        for eval_info in eval_infos:
+            pos = eval_info['pos']
+            batch = eval_info['batch']
+            edge_index = eval_info['edge_index']
+            num_valid_nodes = eval_info['num_valid_nodes']
+            valid_indices = eval_info['valid_indices']
+            
+            # Calculate position in output tensor
+            if single_eval_pos is not None:
+                output_pos = pos - single_eval_pos
+            else:
+                output_pos = pos
+            
+            # Skip if outside output range
+            if output_pos < 0 or output_pos >= seq_len:
+                continue
+            
+            # Get the target tour for this instance
+            tour = targets[output_pos, batch]
+            
+            # Dynamically compute edge labels and weights
+            edge_labels, edge_weights = self._create_edge_labels(
+                edge_index, tour, valid_indices, num_valid_nodes, output.device, eval_info
+            )
+            
+            # Apply loss calculation
+            if edge_labels is not None and edge_weights is not None and len(edge_labels) > 0:
+                num_edges = len(edge_labels)
                 
-                tour = targets[i, j].cpu().tolist()
-                tour_edges = set()
-                tour_len = len(tour)
-                for k in range(tour_len):
-                    n1, n2 = tour[k], tour[(k + 1) % tour_len]
-                    if n1 > n2:
-                        n1, n2 = n2, n1
-                    tour_edges.add((n1, n2))
+                # Get model predictions for this instance
+                pred_logits = output[output_pos, batch, :num_edges]
                 
-                # sorted_edges = [(min(reversed_node_map[edge[0]][-1], reversed_node_map[edge[1]][-1]),
-                #                  max(reversed_node_map[edge[0]][-1], reversed_node_map[edge[1]][-1]))
-                #                 for edge in edges]
-                weights = torch.zeros_like(edge_labels)
-
-                for e_idx, (node0, node1) in enumerate(edges):
-                    u, v = reversed_node_map[node0][-1], reversed_node_map[node1][-1]
-                    if ((u,v) in tour_edges) or ((v,u) in tour_edges):
-                        edge_labels[e_idx] = 1.0 
-                        weights[e_idx] = 1.0
-                    else:
-                        edge_labels[e_idx] = 0.0
-                        weights[e_idx] = 0.25
-
-                loss = (self.bce(output[i, j, :num_edges], edge_labels) * weights).sum() / num_nodes
-                losses[i, j] = loss
+                # Compute weighted BCE loss
+                if len(pred_logits) == len(edge_labels):
+                    loss = (self.bce(pred_logits, edge_labels) * edge_weights).sum()
+                    
+                    # Normalize by number of valid nodes instead of total edges
+                    if num_valid_nodes > 0:
+                        loss = loss / num_valid_nodes
+                        losses[output_pos, batch] = loss
         
         return losses
+
+    def _create_edge_labels(self, edge_index, tour, valid_indices, num_valid_nodes, device, eval_info=None):
+        """
+        Create ground truth edge labels and weights for loss calculation.
+        Always handles bidirectional edges correctly based on loss_direction_mode.
+        Supports both standard mode and merged coordinate mode (SharedBasisFiLM).
         
+        Args:
+            edge_index: Edge indices tensor [2, num_edges] - LOCAL indices for standard mode, GLOBAL indices for SharedBasisFiLM
+            tour: Tour sequence tensor [num_nodes] (with padding) - ORIGINAL indices
+            valid_indices: Valid node indices tensor - ORIGINAL indices  
+            num_valid_nodes: Number of valid nodes
+            device: Computing device
+            eval_info: Additional evaluation info (contains mapping information for SharedBasisFiLM mode)
+            
+        Returns:
+            edge_labels: Binary labels for each edge [num_edges]
+            edge_weights: Weights for each edge in loss calculation [num_edges]
+        """
+        if edge_index.size(1) == 0:
+            return torch.empty(0, device=device), torch.empty(0, device=device)
+        
+        num_edges = edge_index.size(1)
+        edge_labels = torch.zeros(num_edges, device=device)
+        edge_weights = torch.zeros(num_edges, device=device)
+        
+        # Filter out padding values (-1) from tour
+        valid_tour_mask = (tour != -1)
+        if not valid_tour_mask.any() or num_valid_nodes < 2:
+            # No valid tour, return all negative labels with reduced weight
+            edge_weights.fill_(0.25)
+            return edge_labels, edge_weights
+        
+        valid_tour = tour[valid_tour_mask]
+        if len(valid_tour) < 2:
+            # Too few valid nodes for a tour
+            edge_weights.fill_(0.25)
+            return edge_labels, edge_weights
+        
+        # Create tour edges set based on loss_direction_mode (using ORIGINAL indices)
+        tour_edges = set()
+        valid_tour_len = len(valid_tour)
+        for i in range(valid_tour_len):
+            n1, n2 = valid_tour[i].item(), valid_tour[(i + 1) % valid_tour_len].item()
+            
+            if self.loss_direction_mode == 'both':
+                # Add both directions for bidirectional loss
+                tour_edges.add((n1, n2))
+                tour_edges.add((n2, n1))
+            else:  # 'forward' mode
+                # Add only canonical direction (smaller index first)
+                if n1 > n2:
+                    n1, n2 = n2, n1
+                tour_edges.add((n1, n2))
+        
+        # Check if we're in SharedBasisFiLM mode with merged coordinates
+        is_shared_basis_film = eval_info is not None and eval_info.get('is_shared_basis_film', False)
+        
+        # Label each edge
+        for i in range(num_edges):
+            u_idx, v_idx = edge_index[0, i].item(), edge_index[1, i].item()
+            
+            if is_shared_basis_film:
+                # SharedBasisFiLM mode: edge_index contains GLOBAL indices
+                # Need to map global indices to original indices
+                global_to_originals = eval_info['global_to_originals']
+                instance_mapping = eval_info['instance_mapping']
+                pos = eval_info['pos']
+                batch = eval_info['batch']
+                
+                # Find original nodes that correspond to these global indices
+                u_originals = []
+                v_originals = []
+                
+                # Get original nodes for global index u_idx
+                if u_idx in global_to_originals:
+                    for orig_pos, orig_batch, orig_node in global_to_originals[u_idx]:
+                        if orig_pos == pos and orig_batch == batch:
+                            u_originals.append(orig_node)
+                
+                # Get original nodes for global index v_idx  
+                if v_idx in global_to_originals:
+                    for orig_pos, orig_batch, orig_node in global_to_originals[v_idx]:
+                        if orig_pos == pos and orig_batch == batch:
+                            v_originals.append(orig_node)
+                
+                # Check if any combination of original nodes forms a tour edge
+                found_tour_edge = False
+                for u_orig in u_originals:
+                    for v_orig in v_originals:
+                        edge_tuple = (u_orig, v_orig)
+                        if edge_tuple in tour_edges:
+                            found_tour_edge = True
+                            break
+                    if found_tour_edge:
+                        break
+                
+                if found_tour_edge:
+                    edge_labels[i] = 1.0  # Positive label for tour edges
+                    edge_weights[i] = 1.0  # Full weight for tour edges
+                else:
+                    edge_labels[i] = 0.0  # Negative label for non-tour edges
+                    edge_weights[i] = 0.25  # Reduced weight for non-tour edges
+            else:
+                # Standard mode: edge_index contains LOCAL indices
+                # Map local indices to original indices
+                if u_idx < len(valid_indices) and v_idx < len(valid_indices):
+                    u_original = valid_indices[u_idx].item()
+                    v_original = valid_indices[v_idx].item()
+                    
+                    edge_tuple = (u_original, v_original)
+                    
+                    if edge_tuple in tour_edges:
+                        edge_labels[i] = 1.0  # Positive label for tour edges
+                        edge_weights[i] = 1.0  # Full weight for tour edges
+                    else:
+                        edge_labels[i] = 0.0  # Negative label for non-tour edges
+                        edge_weights[i] = 0.25  # Reduced weight for non-tour edges
+                else:
+                    # Invalid local indices, treat as negative with reduced weight
+                    edge_labels[i] = 0.0
+                    edge_weights[i] = 0.25
+        
+        # Debug: print label statistics for first few batches
+        if not hasattr(self, '_debug_label_count'):
+            self._debug_label_count = 0
+        
+        if self._debug_label_count < 1:  # Only print for first 3 calls
+            positive_labels = (edge_labels == 1.0).sum().item()
+            total_edges = len(edge_labels)
+            print(f"Debug _create_edge_labels #{self._debug_label_count}: {positive_labels}/{total_edges} positive labels")
+            print(f"  tour_edges: {len(tour_edges)}, valid_indices: {valid_indices.tolist()}")
+            print(f"  Sample edges: {[(edge_index[0, i].item(), edge_index[1, i].item()) for i in range(min(5, num_edges))]}")
+            self._debug_label_count += 1
+        
+        return edge_labels, edge_weights
+
 class Losses():
     gaussian = nn.GaussianNLLLoss(full=True, reduction='none')
     mse = nn.MSELoss(reduction='none')
@@ -151,7 +326,7 @@ def train(priordataloader_class_or_get_batch: prior.PriorDataLoader | callable, 
                                  , nlayers=nlayers
                                  , dropout=dropout
                                  , style_encoder=style_encoder
-                                 , y_encoder=y_encoder_generator(1, emsize)
+                                 , y_encoder=y_encoder_generator(1, emsize) if y_encoder_generator is not None else None
                                  , input_normalization=input_normalization
                                  , pos_encoder=pos_encoder
                                  , decoder_dict=decoder_dict
@@ -207,7 +382,7 @@ def train(priordataloader_class_or_get_batch: prior.PriorDataLoader | callable, 
         ignore_steps = 0
         before_get_batch = time.time()
         assert len(dl) % aggregate_k_gradients == 0, 'Please set the number of steps per epoch s.t. `aggregate_k_gradients` divides it.'
-        tqdm_iter = tqdm(range(len(dl)), desc='Training Epoch') if rank==0 and progress_bar else None
+        tqdm_iter = tqdm(range(len(dl)), desc='Training Epoch') if progress_bar else None
 
         for batch, full_data in enumerate(dl):
             data = (full_data.style.to(device) if full_data.style is not None else None, full_data.x.to(device), full_data.y.to(device))
@@ -229,61 +404,67 @@ def train(priordataloader_class_or_get_batch: prior.PriorDataLoader | callable, 
             with cm:
                 time_to_get_batch = time.time() - before_get_batch
                 before_forward = time.time()
-                try:
-                    metrics_to_log = {}
-                    with autocast(device.split(':')[0], enabled=scaler is not None):
-                        output, edge_info = model(tuple(e.to(device) if torch.is_tensor(e) else e for e in data),
-                                    single_eval_pos=single_eval_pos, only_return_standard_out=False, candidate_info=candidate_info)
+                
+                metrics_to_log = {}
+                with autocast(device.split(':')[0], enabled=scaler is not None):
+                    output, edge_info = model(tuple(e.to(device) if torch.is_tensor(e) else e for e in data),
+                                single_eval_pos=single_eval_pos, only_return_standard_out=False, candidate_info=candidate_info)
+                    
+                    forward_time = time.time() - before_forward
+                    before_loss = time.time()
+
+                    if single_eval_pos is not None:
+                        targets = targets[single_eval_pos:]
+                
+                    losses = criterion(output, targets, edge_info, single_eval_pos)
+                    losses = losses.view(-1, output.shape[1]) 
+                                                              
+                    loss, nan_share = utils.torch_nanmean(losses.mean(0), return_nanshare=True)
+
+                    # If loss is a zero tensor with no grad_fn (e.g. from a batch with no valid targets),
+                    # connect it to the computation graph to prevent a crash in backward().
+                    if not loss.requires_grad:
+                        loss = loss + 0.0 * output.sum()
                         
-                        forward_time = time.time() - before_forward
-                        before_loss = time.time()
+                    loss_scaled = loss / aggregate_k_gradients
+                    loss_time = time.time() - before_loss
 
-                        if single_eval_pos is not None:
-                            targets = targets[single_eval_pos:]
-                    
-                        losses = criterion(output, targets, edge_info, single_eval_pos)
-                        losses = losses.view(-1, output.shape[1]) 
-                                                                  
-                        loss, nan_share = utils.torch_nanmean(losses.mean(0), return_nanshare=True)
-                        loss_scaled = loss / aggregate_k_gradients
-                        loss_time = time.time() - before_loss
+                if scaler: loss_scaled = scaler.scale(loss_scaled)
 
-                    if scaler: loss_scaled = scaler.scale(loss_scaled)
+                loss_scaled.backward()
+                
+                loss_backward_time = time.time() - before_loss
 
-                    loss_scaled.backward()
-                    
-                    loss_backward_time = time.time() - before_loss
+                if batch % aggregate_k_gradients == aggregate_k_gradients - 1:
+                    if scaler: scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.)
+                    if scaler:
+                        scaler.step(optimizer)
+                        scaler.update()
+                    else:
+                        optimizer.step()
+                    optimizer.zero_grad()
 
-                    if batch % aggregate_k_gradients == aggregate_k_gradients - 1:
-                        if scaler: scaler.unscale_(optimizer)
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.)
-                        if scaler:
-                            scaler.step(optimizer)
-                            scaler.update()
-                        else:
-                            optimizer.step()
-                        optimizer.zero_grad()
+                step_time = time.time() - before_forward
 
-                    step_time = time.time() - before_forward
+                if not torch.isnan(loss):
+                    total_loss += loss.cpu().detach().item()
+                    total_positional_losses += losses.mean(1).cpu().detach() if single_eval_pos is None else \
+                        nn.functional.one_hot(torch.tensor(single_eval_pos), seq_len)*\
+                        utils.torch_nanmean(losses[:seq_len-single_eval_pos].mean(0)).cpu().detach()
 
-                    if not torch.isnan(loss):
-                        total_loss += loss.cpu().detach().item()
-                        total_positional_losses += losses.mean(1).cpu().detach() if single_eval_pos is None else \
-                            nn.functional.one_hot(torch.tensor(single_eval_pos), seq_len)*\
-                            utils.torch_nanmean(losses[:seq_len-single_eval_pos].mean(0)).cpu().detach()
+                    total_positional_losses_recorded += torch.ones(seq_len) if single_eval_pos is None else \
+                        nn.functional.one_hot(torch.tensor(single_eval_pos), seq_len)
 
-                        total_positional_losses_recorded += torch.ones(seq_len) if single_eval_pos is None else \
-                            nn.functional.one_hot(torch.tensor(single_eval_pos), seq_len)
-
-                        metrics_to_log = {**metrics_to_log, **{f"loss": loss, "single_eval_pos": single_eval_pos}}
-                        if step_callback is not None and rank == 0:
-                            step_callback(metrics_to_log)
-                        nan_steps += nan_share
-                        ignore_steps += (targets == -100).float().mean()
-                except Exception as e:
-                    print("Invalid step encountered, skipping...")
-                    print(e)
-                    raise(e)
+                    metrics_to_log = {**metrics_to_log, **{f"loss": loss, "single_eval_pos": single_eval_pos}}
+                    if step_callback is not None and rank == 0:
+                        step_callback(metrics_to_log)
+                    nan_steps += nan_share
+                    ignore_steps += (targets == -100).float().mean()
+            # except Exception as e:
+            #     print("Invalid step encountered, skipping...")
+            #     print(e)
+            #     raise(e)
 
             if tqdm_iter:
                 tqdm_iter.set_postfix({'data_time': time_to_get_batch, 'step_time': step_time, 'mean_loss': total_loss / (batch+1)})
@@ -369,11 +550,16 @@ def train_tsp(
     gpu_device=None,
     max_candidates=15,
     priordataloader_class=None,
+    use_unified_encoding=False,
+    use_shared_basis_film=False,
+    merge_duplicate_coords=True,
+    loss_direction_mode='both',
     **extra_args
 ):
     """
     Train a Transformer model for TSP instances using GNN for node encoding.
     Uses the original train() function with custom encoders and loss function.
+    Always creates bidirectional edges for optimal GNN performance.
     
     Args:
         emsize: Embedding size
@@ -392,13 +578,33 @@ def train_tsp(
         gpu_device: Device to use for computation (defaults to cuda if available)
         max_candidates: Maximum number of candidates per node for LKH3
         priordataloader_class: Custom dataloader class (defaults to TSPDataLoader)
+        use_unified_encoding: If True, uses unified encoding that combines graph and tour information
+        use_shared_basis_film: If True, uses SharedBasisFiLMAttentionGNN for merged large graph processing
+        merge_duplicate_coords: If True and use_shared_basis_film=True, merge nodes with identical coordinates
+        loss_direction_mode: How to handle edge directions in loss calculation. Options:
+            - 'both': Use both directions (u->v and v->u) for bidirectional learning - DEFAULT
+            - 'forward': Use only forward/canonical direction (u->v where u < v)
         **extra_args: Additional arguments for train function
         
     Returns:
         TrainingResult object
     """
     device = gpu_device if gpu_device else ('cuda:0' if torch.cuda.is_available() else 'cpu')
+    
+    # Validate direction mode
+    if loss_direction_mode not in ['both', 'forward']:
+        raise ValueError(f"loss_direction_mode must be one of ['both', 'forward'], got {loss_direction_mode}")
+    
+    # Log configuration
     print(f"Training TSP model on {device} with {emsize} embedding size")
+    print(f"Edge configuration:")
+    print(f"  - Always create bidirectional edges: True (optimal for GNN)")
+    print(f"  - Loss direction mode: {loss_direction_mode}")
+    
+    if loss_direction_mode == 'both':
+        print("  ✓ Optimal configuration: bidirectional edge creation + bidirectional loss calculation")
+    else:
+        print("  ✓ Standard configuration: bidirectional edge creation + forward loss calculation")
     
     # Use provided dataloader class or default to TSPDataLoader
     if priordataloader_class is None:
@@ -409,11 +615,8 @@ def train_tsp(
     # Create single_eval_pos sampler
     single_eval_pos_sampler = get_uniform_single_eval_pos_sampler(seq_len, min_len=3)
     
-    # Create custom loss for BMM with edge attention
-    
-        
-    # Create the custom TSP criterion
-    tsp_criterion = TSPAttentionCriterion()
+    # Create custom loss for edge prediction with direction control
+    tsp_criterion = TSPAttentionCriterion(loss_direction_mode=loss_direction_mode)
     
     # Prepare extra_prior_kwargs_dict
     default_kwargs = {
@@ -426,12 +629,52 @@ def train_tsp(
         default_kwargs.update(extra_args['extra_prior_kwargs_dict'])
         extra_args = {k: v for k, v in extra_args.items() if k != 'extra_prior_kwargs_dict'}
     
+    # Define valid model parameters
+    valid_model_params = {
+        'input_normalization', 'init_method', 'pre_norm', 'activation',
+        'recompute_attn', 'num_global_att_tokens', 'full_attention',
+        'all_layers_same_init', 'efficient_eval_masking', 'decoder_once_dict',
+        'return_all_outputs', 'save_trainingset_representations'
+    }
+    
+    # Filter out parameters that should not be passed to TransformerModel
+    model_extra_args = {k: v for k, v in extra_args.items() 
+                       if k in valid_model_params}
+    
+    # Create encoder generator (always creates bidirectional edges)
+    num_instances = batch_size * seq_len
+    encoder_generator = lambda num_features, emsize: tsp_graph_encoder_generator(
+        num_features, emsize, 
+        max_candidates=max_candidates, 
+        use_unified_encoding=use_unified_encoding,
+        use_shared_basis_film=use_shared_basis_film,
+        merge_duplicate_coords=merge_duplicate_coords,
+        num_instances=num_instances,
+        loss_direction_mode=loss_direction_mode
+    )
+    
+    # Determine y_encoder_generator based on encoding setting
+    if use_shared_basis_film:
+        # SharedBasisFiLM mode does direct edge prediction, no separate y_encoder needed
+        y_encoder_generator = None
+        print(f"Using SharedBasisFiLM mode - merging all instances into single large graph with direct edge prediction")
+    elif use_unified_encoding:
+        # When using unified encoding, we don't need a separate y_encoder
+        y_encoder_generator = None
+        print(f"Using unified encoding - graph and tour information will be processed together")
+    else:
+        # Use separate tour encoder
+        y_encoder_generator = lambda num_features, emsize: tsp_tour_encoder_generator(
+            num_features, emsize, max_nodes=max(num_nodes_range)
+        )
+        print(f"Using separate encoders - graph encoder and tour encoder")
+    
     # Use train() function with the custom components
     result = train(
         priordataloader_class_or_get_batch=priordataloader_class,
         criterion=tsp_criterion,
-        encoder_generator=tsp_graph_encoder_generator,
-        y_encoder_generator=lambda num_features, emsize: tsp_tour_encoder_generator(num_features, emsize, max_nodes=max(num_nodes_range)),
+        encoder_generator=encoder_generator,
+        y_encoder_generator=y_encoder_generator,
         emsize=emsize,
         nhid=nhid,
         nlayers=nlayers,
@@ -447,7 +690,8 @@ def train_tsp(
         extra_prior_kwargs_dict=default_kwargs,
         single_eval_pos_gen=single_eval_pos_sampler,
         gpu_device=device,
-        **extra_args
+        progress_bar=extra_args.get('progress_bar', True),
+        **model_extra_args
     )
     
     return result
