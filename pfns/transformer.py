@@ -276,7 +276,10 @@ class TransformerModel(nn.Module):
         if y_src is not None and self.y_encoder is not None and not encoder_supports_unified:
             y_shape_adjusted = y_src.unsqueeze(-1) if len(y_src.shape) < len(x_encoded.shape) else y_src
             if edge_info is not None:
-                edge_emb, edge_index, batch, position_tensor, node_offset_map, edge_counts = edge_info
+                if len(edge_info) == 7:
+                    edge_emb, edge_index, batch, position_tensor, node_offset_map, edge_counts, _ = [edge_info[key] for key in edge_info]
+                else:
+                    edge_emb, edge_index, batch, position_tensor, node_offset_map, edge_counts = edge_info
                 y_encoded = self.y_encoder(
                     y_shape_adjusted,
                     edge_emb=edge_emb,
