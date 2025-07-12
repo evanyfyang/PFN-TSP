@@ -3,6 +3,9 @@
 
 import numpy as np
 import torch
+import random
+import math
+from copy import *
 
 def greedy_decode(adj_list, num_nodes):
     """
@@ -367,3 +370,132 @@ def mcmc_decode(adj_list, node_map, edge_index, edge_values, num_nodes, num_iter
                 best_length = current_length
     
     return best_tour 
+
+
+
+def mcts_decode(adj_list, num_nodes, simulations_per_node=20, exploration_const=1.41, start_node = 0):
+    """
+    MCTS decoding strategy using UCT formula for exploration-exploitation balance.
+
+    Args:
+        adj_list: dict, adjacency list with node -> list of (neighbor, probability)
+        num_nodes: int, total number of nodes to visit
+        simulations_per_node: int, number of rollouts per action
+        exploration_const: float, UCT exploration constant
+
+    Returns:
+        tour: list of visited nodes in decoded path
+    """
+    current_node = start_node
+    tour = [current_node]
+    visited = set([current_node])
+
+    while len(tour) < num_nodes:
+        neighbors = adj_list[current_node]
+        valid_neighbors = [(node, prob) for node, prob in neighbors if node not in visited]
+
+        # Fallback: if all neighbors visited, pick from unvisited
+        if not valid_neighbors:
+            unvisited = list(set(range(num_nodes)) - visited)
+            if not unvisited:
+                break
+            next_node = unvisited[0]
+        else:
+            stats = {}  # node: [total_reward, visit_count]
+            total_simulations = 0
+
+            # Perform simulations for each possible next node
+            for node, prob in valid_neighbors:
+                total_reward = 0
+                for _ in range(simulations_per_node):
+                    total_reward += simulate_random_tour(node, visited, adj_list, num_nodes, prob)
+                stats[node] = [total_reward, simulations_per_node]
+                total_simulations += simulations_per_node
+
+            # Compute UCT score for each child
+            scores = {}
+            for node, (total_reward, visits) in stats.items():
+                avg_reward = total_reward / visits
+                uct_score = avg_reward + exploration_const * math.sqrt(math.log(total_simulations) / visits)
+                scores[node] = uct_score
+
+            # Select the node with the highest UCT score
+            next_node = max(scores.items(), key=lambda x: x[1])[0]
+
+        # Update path
+        tour.append(next_node)
+        visited.add(next_node)
+        current_node = next_node
+
+    return tour
+
+def mcts_all_decode(adj_list, num_nodes, simulations_per_node=20, exploration_const=1.41):
+    """
+    Tries MCTS decoding from all possible start nodes and returns the best tour. Similar to mcts_decode, just try all possible starts. 
+    """
+    best_tour = None
+    best_score = -float('inf') #the objective is to pick the one with highest probability
+
+    for start_node in range(num_nodes):
+        tour = mcts_decode(
+            adj_list, num_nodes,
+            simulations_per_node=simulations_per_node,
+            exploration_const=exploration_const,
+            start_node=start_node
+        )
+
+        # Evaluate total path probability of the tour
+        score = evaluate_tour_probability(tour, adj_list)
+
+        if score > best_score:
+            best_tour = tour
+            best_score = score
+
+    # If all attempts fail, use the mcts starting from node 0
+    if best_tour is None:
+        best_tour = mcts_decode(adj_list, num_nodes)
+
+    return best_tour
+
+def simulate_random_tour(start_node, visited, adj_list, num_nodes, init_prob):
+    """
+    Simulates a random rollout from a candidate node.
+
+    Args:
+        start_node: node to begin from
+        visited: set of already visited nodes
+        adj_list: adjacency list
+        num_nodes: total number of nodes
+        init_prob: initial probability to start_node
+
+    Returns:
+        Product of transition probabilities along simulated path
+    """
+    tour_prob = init_prob
+    current_node = start_node
+    local_visited = visited.copy()
+    local_visited.add(start_node)
+
+    while len(local_visited) < num_nodes:
+        neighbors = adj_list[current_node]
+        valid_neighbors = [(n, p) for n, p in neighbors if n not in local_visited]
+        if not valid_neighbors:
+            break
+        next_node, prob = random.choices(valid_neighbors, weights=[p for _, p in valid_neighbors])[0]
+        tour_prob *= prob
+        local_visited.add(next_node)
+        current_node = next_node
+
+    return tour_prob
+
+def evaluate_tour_probability(tour, adj_list):
+    """
+    Computes the product of edge probabilities for the given tour.
+    """
+    prob = 1.0
+    for i in range(len(tour) - 1):
+        current = tour[i]
+        next_node = tour[i + 1]
+        edge_prob = dict(adj_list[current]).get(next_node, 0.0)
+        prob *= edge_prob
+    return prob

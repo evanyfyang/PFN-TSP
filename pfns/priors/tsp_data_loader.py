@@ -206,6 +206,70 @@ def solve_tsp_static_with_or_tools_and_initial_solutions(initial_solution: list,
         return tour[1:]#need to eliminate fake depot
     else:
         return list(range(num_nodes))
+    
+
+
+def solve_2_opt_with_initial_solutions(initial_solution: list, coords: np.ndarray, time_limit=1):
+    """
+    Performs best-improvement 2-opt optimization to improve a TSP tour.
+
+    Args:
+        initial_solution: list of node indices representing the initial tour
+        coords: np.ndarray of shape (n_nodes, 2), (x, y) coordinates for each node
+        time_limit: float, max allowed runtime in seconds
+
+    Returns:
+        best: list of node indices representing the optimized tour
+    """
+
+    def calculate_total_distance(tour):
+        """
+        Computes the total length of the tour using Euclidean distance.
+        """
+        return sum(
+            np.linalg.norm(coords[tour[i]] - coords[tour[(i + 1) % len(tour)]])
+            for i in range(len(tour))
+        )
+
+    def swap_2opt(tour, i, k):
+        """
+        Reverses the tour segment between indices i and k (inclusive).
+        """
+        return tour[:i] + tour[i:k+1][::-1] + tour[k+1:]
+
+    best = initial_solution.copy()
+    best_distance = calculate_total_distance(best)
+
+    start_time = time.time()
+    improved = True
+
+    while improved and time.time() - start_time < time_limit:
+        improved = False
+        best_move = None
+        best_move_distance = best_distance
+
+        # Check all possible 2-opt swaps
+        for i in range(1, len(best) - 2):
+            for k in range(i + 1, len(best) - 1):
+                candidate = swap_2opt(best, i, k)
+                candidate_distance = calculate_total_distance(candidate)
+
+                # Save the best move found in this iteration
+                if candidate_distance < best_move_distance:
+                    best_move = candidate
+                    best_move_distance = candidate_distance
+                    improved = True  # found an improvement
+
+        # Apply the best improving move (if any)
+        if improved:
+            best = best_move
+            best_distance = best_move_distance
+    if best_distance < calculate_total_distance(initial_solution) :
+        return best
+    else:
+        print("2-opt could not improve given initial solutions.")
+        return initial_solution  
+
 
 def solve_tsp_lkh3_parallel_worker(args):
     """Worker function for parallel LKH3 solving"""

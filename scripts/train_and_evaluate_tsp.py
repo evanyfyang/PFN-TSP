@@ -17,7 +17,7 @@ import random
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from pfns.train_tsp import train_tsp
-from pfns.priors.tsp_data_loader import TSPDataLoader, solve_tsp_ortools, solve_tsp_static_with_or_tools_and_initial_solutions
+from pfns.priors.tsp_data_loader import TSPDataLoader, solve_tsp_ortools, solve_tsp_static_with_or_tools_and_initial_solutions, solve_2_opt_with_initial_solutions
 from pfns.priors.tsp_offline_data_loader import TSPOfflineDataLoader
 from pfns.priors.prior import Batch
 from pfns.priors.tsp_decoding_strategies import *
@@ -44,7 +44,7 @@ def parse_args():
     parser.add_argument('--train', action='store_true', help='Whether to train the model (otherwise just test)')
     parser.add_argument('--model_path', type=str, default=None, help='Path to pretrained model for testing')
     parser.add_argument('--decoding_strategy', type=str, default='greedy', 
-                        choices=['greedy', 'beam_search', 'mcmc', 'greedy_all', 'beam_search_all', 'greedy_edge'], 
+                        choices=['greedy', 'beam_search', 'mcmc', 'greedy_all', 'beam_search_all', 'greedy_edge', 'mcts', 'mcts_all'], 
                         help='Decoding strategy for TSP')
     parser.add_argument('--test_instances', type=int, default=1, help='Number of test instances')
     parser.add_argument('--use_complete_graph', action='store_true', default=False, 
@@ -343,6 +343,10 @@ def predict_tsp_with_pfn(model, coords, solution, candidate_info=None, use_compl
             tour = mcmc_decode(adj_list, node_map, edge_index_np, edge_values_np, num_nodes)
         elif decoding_strategy == 'greedy_edge':
             tour = greedy_edge_decode(adj_list, num_nodes)
+        elif decoding_strategy == 'mcts':
+            tour = mcts_decode(adj_list, num_nodes)
+        elif decoding_strategy == 'mcts_all':
+            tour = mcts_all_decode(adj_list, num_nodes)
         else:
             raise ValueError(f"Unknown decoding strategy: {decoding_strategy}")
     
@@ -811,9 +815,11 @@ def evaluate_and_compare(model, test_instances, lkh_solutions, candidate_infos, 
     pfn_distances = []
     ortools_distances = []
     pfn_or_distances = []
+    pfn_2opt_distances = []
     processing_times_pfn = []
     processing_times_ortools = []
     processing_times_pfn_or = []
+    processing_times_pfn_2opt = []
     
     viz_idx = np.random.randint(0, len(test_instances))
     
@@ -872,16 +878,33 @@ def evaluate_and_compare(model, test_instances, lkh_solutions, candidate_infos, 
         pfn_or_distances.append(pfn_or_distance)
         processing_times_pfn_or.append(pfn_or_time)
 
-        # Step 4: Report comparison results
-        print(f"  Results: PFN distance={pfn_distance:.4f}, OR-Tools distance={ortools_distance:.4f}, PFN-OR distance = {pfn_or_distance:.4f}")
-        print(f"  Times: PFN={pfn_time:.4f}s, OR-Tools={ortools_solve_time:.4f}, PFN-OR={pfn_or_time:.4f}")
+        # Step 4: Use model to predict solution, optimize with 2-opt, and record time
+        print(f"  Computing PFN solution (again)...")
+        start_time = time.time()
+        pfn_or_tour_initial, _ = predict_tsp_with_pfn(
+            model, coords_seq, lkh_solution_seq, 
+            candidate_info=candidate_info_seq, 
+            use_complete_graph=use_complete_graph,
+            device=device, 
+            decoding_strategy=decoding_strategy
+        )
+        pfn_2opt_tour = solve_2_opt_with_initial_solutions(pfn_or_tour_initial, last_coords, time_limit = 1)
+        pfn_2opt_time = time.time() - start_time
+        pfn_2opt_distance = calculate_tour_length(last_coords, pfn_2opt_tour)
+        pfn_2opt_distances.append(pfn_2opt_distance)
+        processing_times_pfn_2opt.append(pfn_2opt_time)
+
+        # Step 5: Report comparison results
+        print(f"  Results: PFN distance={pfn_distance:.4f}, OR-Tools distance={ortools_distance:.4f}, PFN-OR distance = {pfn_or_distance:.4f}, PFN-2opt distance = {pfn_2opt_distance:.4f}")
+        print(f"  Times: PFN={pfn_time:.4f}s, OR-Tools={ortools_solve_time:.4f}, PFN-OR={pfn_or_time:.4f}, PFN-2opt={pfn_2opt_time:.4f}")
         
         # Save visualization for one random instance
         if i == viz_idx and save_plot:
-            fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(24, 8))
+            fig, ((ax1,ax2), (ax3, ax4))= plt.subplots(2, 2, figsize=(16, 16))
             plot_tour(last_coords, pfn_tour, f"PFN Tour ({decoding_strategy}, distance: {pfn_distance:.4f})", ax=ax1)
             plot_tour(last_coords, ortools_tour, f"OR-Tools Tour (distance: {ortools_distance:.4f})", ax=ax2)
-            plot_tour(last_coords, pfn_or_tour, f"OR-Tools Tour (distance: {pfn_or_distance:.4f})", ax=ax3)
+            plot_tour(last_coords, pfn_or_tour, f"PFN + OR-Tools Tour (distance: {pfn_or_distance:.4f})", ax=ax3)
+            plot_tour(last_coords, pfn_2opt_tour, f"PFN + 2-opt Tour (distance: {pfn_2opt_distance:.4f})", ax=ax4)
             plt.tight_layout()
             plt.savefig(plot_path)
             plt.close()
@@ -891,8 +914,10 @@ def evaluate_and_compare(model, test_instances, lkh_solutions, candidate_infos, 
     pfn_distances = np.array(pfn_distances)
     ortools_distances = np.array(ortools_distances)
     pfn_or_distances = np.array(pfn_or_distances)
+    pfn_2opt_distances = np.array(pfn_2opt_distances)
     relative_gap_purePFN = (pfn_distances - ortools_distances) / ortools_distances * 100
     relative_gap_PFNOR = (pfn_or_distances - ortools_distances) / ortools_distances * 100
+    relative_gap_PFN2opt = (pfn_2opt_distances - ortools_distances) / ortools_distances * 100
     
     print("\n===== Evaluation Results =====")
     print(f"Average path length: PFN={np.mean(pfn_distances):.4f}, OR-Tools={np.mean(ortools_distances):.4f}, PFN-OR={np.mean(pfn_or_distances):.4f}")
@@ -902,10 +927,15 @@ def evaluate_and_compare(model, test_instances, lkh_solutions, candidate_infos, 
     print(f"Average relative gap - PFN + OR: {np.mean(relative_gap_PFNOR):.2f}%")
     print(f"Maximum relative gap - PFN + OR: {np.max(relative_gap_PFNOR):.2f}%")
     print(f"Minimum relative gap - PFN + OR: {np.min(relative_gap_PFNOR):.2f}%")
+    print(f"Average relative gap - PFN + 2opt: {np.mean(relative_gap_PFN2opt):.2f}%")
+    print(f"Maximum relative gap - PFN + 2opt: {np.max(relative_gap_PFN2opt):.2f}%")
+    print(f"Minimum relative gap - PFN + 2opt: {np.min(relative_gap_PFN2opt):.2f}%")
     print(f"Pure PFN win rate: {np.mean(pfn_distances <= ortools_distances) * 100:.2f}%")
     print(f"Pure PFN average processing time: {np.mean(processing_times_pfn):.4f} seconds")
-    print(f"PFN OR  win rate: {np.mean(pfn_or_distances <= ortools_distances) * 100:.2f}%")
+    print(f"PFN OR win rate: {np.mean(pfn_or_distances <= ortools_distances) * 100:.2f}%")
     print(f"PFN OR average processing time: {np.mean(processing_times_pfn_or):.4f} seconds")
+    print(f"PFN 2-opt win rate: {np.mean(pfn_2opt_distances <= ortools_distances) * 100:.2f}%")
+    print(f"PFN 2-opt average processing time: {np.mean(processing_times_pfn_2opt):.4f} seconds")
     print(f"OR-Tools average processing time: {np.mean(processing_times_ortools):.4f} seconds")
     print(f"Speed ratio (OR-Tools/PFN): {np.mean(processing_times_ortools)/np.mean(processing_times_pfn):.2f}x")
     
