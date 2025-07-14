@@ -44,7 +44,7 @@ def parse_args():
     parser.add_argument('--train', action='store_true', help='Whether to train the model (otherwise just test)')
     parser.add_argument('--model_path', type=str, default=None, help='Path to pretrained model for testing')
     parser.add_argument('--decoding_strategy', type=str, default='greedy', 
-                        choices=['greedy', 'beam_search', 'mcmc', 'greedy_all', 'beam_search_all', 'greedy_edge', 'mcts', 'mcts_all'], 
+                        choices=['greedy', 'beam_search', 'mcmc', 'greedy_all', 'greedy_edge', 'sampling','sampling_edge', 'sampling_all', 'beam_search_all', 'greedy_edge', 'mcts', 'mcts_all'], 
                         help='Decoding strategy for TSP')
     parser.add_argument('--test_instances', type=int, default=1, help='Number of test instances')
     parser.add_argument('--use_complete_graph', action='store_true', default=False, 
@@ -335,8 +335,16 @@ def predict_tsp_with_pfn(model, coords, solution, candidate_info=None, use_compl
             tour = greedy_decode(adj_list, num_nodes)
         elif decoding_strategy == 'greedy_all':
             tour = greedy_all_decode(adj_list, num_nodes)
+        elif decoding_strategy == 'greedy_edge':
+            tour = greedy_edge_decode(adj_list, num_nodes)
         elif decoding_strategy == 'beam_search':
             tour = beam_search_decode(adj_list, num_nodes)
+        elif decoding_strategy == 'sampling':
+            tour = sampling_decode(adj_list, num_nodes)
+        elif decoding_strategy == 'sampling_all':
+            tour = sampling_all_decode(adj_list, num_nodes)
+        elif decoding_strategy == 'sampling_edge':
+            tour = sampling_edge_decode(adj_list, num_nodes)
         elif decoding_strategy == 'beam_search_all':
             tour = beam_search_all_decode(adj_list, num_nodes)
         elif decoding_strategy == 'mcmc':

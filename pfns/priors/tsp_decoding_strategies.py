@@ -187,6 +187,237 @@ def greedy_all_decode(adj_list, num_nodes):
     
     return best_tour
 
+def sampling_decode(adj_list, num_nodes):
+    """
+    Sampling decoding strategy starting from node 0.
+    Randomly chooses the next node based on edge probabilities.
+    """
+    current_node = 0
+    tour = [current_node]
+    visited = set([current_node])
+    
+    while len(tour) < num_nodes:
+        neighbors = adj_list[current_node]
+        
+        valid_neighbors = [(node, prob) for node, prob in neighbors if node not in visited]
+        if not valid_neighbors:
+            break
+        
+        # If there are no valid neighbors, choose the first unvisited node
+        if not valid_neighbors:
+            unvisited = list(set(range(num_nodes)) - visited)
+            if unvisited:
+                next_node = unvisited[0]
+            else:
+                break
+        else:
+            # Normalize the probabilities
+            total_prob = sum(prob for _, prob in valid_neighbors)
+            if total_prob == 0:
+                # Avoid division by zero: fallback to uniform sampling
+                nodes, _ = zip(*valid_neighbors)
+                next_node = random.choice(nodes)
+            else:
+                nodes, probs = zip(*valid_neighbors)
+                norm_probs = [p / total_prob for p in probs]
+                next_node = random.choices(nodes, weights=norm_probs, k=1)[0]
+            
+        tour.append(next_node)
+        visited.add(next_node)
+        current_node = next_node
+    
+    return tour
+
+
+def sampling_edge_decode(adj_list, num_nodes):
+    """
+    Edge-based sampling decoding strategy using union-find and degree counting.
+    """
+    class UnionFind:
+        def __init__(self, n):
+            self.parent = list(range(n))
+            self.rank = [0] * n
+            self.components = n
+        
+        def find(self, x):
+            if self.parent[x] != x:
+                self.parent[x] = self.find(self.parent[x])
+            return self.parent[x]
+        
+        def union(self, x, y):
+            px, py = self.find(x), self.find(y)
+            if px == py:
+                return False
+            
+            if self.rank[px] < self.rank[py]:
+                px, py = py, px
+            self.parent[py] = px
+            if self.rank[px] == self.rank[py]:
+                self.rank[px] += 1
+            self.components -= 1
+            return True
+        
+        def connected(self, x, y):
+            return self.find(x) == self.find(y)
+    
+    # Collect all unique undirected edges with their probabilities
+    edge_list = []
+    for u in range(num_nodes):
+        for v, prob in adj_list[u]:
+            if u < v:
+                edge_list.append((u, v, prob))
+
+    # Normalize probabilities
+    total_prob = sum(prob for _, _, prob in edge_list)
+    if total_prob <= 0:
+        # Fallback to uniform probabilities if all are zero
+        norm_probs = [1.0 / len(edge_list)] * len(edge_list)
+    else:
+        norm_probs = []
+        for _, _, prob in edge_list:
+            norm_probs.append(prob / total_prob)
+      
+    
+    uf = UnionFind(num_nodes)
+    degree = [0] * num_nodes
+    selected_edges = []
+    used_indices = set() #to record if a edge has been appended/selected
+    
+    while len(selected_edges) < num_nodes and len(used_indices) < len(edge_list):
+        # Sample one edge at a time
+        idx = random.choices(range(len(edge_list)), weights=norm_probs, k=1)[0]
+        if idx in used_indices: #edge already selected
+            continue
+        used_indices.add(idx)
+
+        u, v, _ = edge_list[idx]
+
+        if degree[u] >= 2 or degree[v] >= 2: #each node has 1 enter and 1 exit
+            continue
+        if uf.connected(u, v) and len(selected_edges) < num_nodes - 1: #2 nodes have been connected
+            continue
+
+        selected_edges.append((u, v))
+        degree[u] += 1
+        degree[v] += 1
+        uf.union(u, v)
+
+    # Attempt to close the cycle if needed
+    if len(selected_edges) < num_nodes:
+        endpoints = [i for i in range(num_nodes) if degree[i] == 1]
+        if len(endpoints) == 2:
+            u, v = endpoints
+            selected_edges.append((u, v))
+        else:
+            return sampling_decode(adj_list, num_nodes)
+    
+    def edges_to_tour(edges, num_nodes):
+        graph = {i: [] for i in range(num_nodes)}
+        for u, v in edges:
+            graph[u].append(v)
+            graph[v].append(u)
+        
+        tour = [0]
+        visited = {0}
+        current = 0
+        
+        while len(tour) < num_nodes:
+            next_node = None
+            for neighbor in graph[current]:
+                if neighbor not in visited:
+                    next_node = neighbor
+                    break
+            
+            if next_node is None:
+                break
+            
+            tour.append(next_node)
+            visited.add(next_node)
+            current = next_node
+        
+        return tour
+    
+    tour = edges_to_tour(selected_edges, num_nodes)
+    
+    if len(tour) < num_nodes:
+        return sampling_decode(adj_list, num_nodes)
+    
+    return tour
+
+
+def sampling_all_decode(adj_list, num_nodes):
+    """
+    Try sampling-based decoding starting from each node and select the best tour.
+    """
+    best_tour = None
+    best_tour_prob = -float('inf')
+    
+    for start_node in range(num_nodes):
+        current_node = start_node
+        tour = [current_node]
+        visited = set([current_node])
+        tour_prob = 0.0
+
+        while len(tour) < num_nodes:
+            neighbors = adj_list[current_node]
+
+            # Filter unvisited neighbors
+            valid_neighbors = []
+            for node, prob in neighbors:
+                if node not in visited:
+                    valid_neighbors.append((node, prob))
+            
+            if not valid_neighbors:
+                # Fallback: pick any unvisited node with zero probability
+                unvisited = [i for i in range(num_nodes) if i not in visited]
+                if unvisited:
+                    next_node = random.choice(unvisited)
+                    prob = 0.0  # penalty
+                else:
+                    break
+            else:
+                total_prob = sum(prob for _, prob in valid_neighbors)
+                if total_prob <= 0:
+                    # Uniform sampling
+                    idx = random.randint(0, len(valid_neighbors) - 1)
+                    next_node, prob = valid_neighbors[idx]
+                else:
+                    nodes = []
+                    norm_probs = []
+                    for node, prob in valid_neighbors:
+                        nodes.append(node)
+                        norm_probs.append(prob / total_prob)
+                    next_node = random.choices(nodes, weights=norm_probs, k=1)[0]
+                    for i in range(len(nodes)):
+                        if nodes[i] == next_node:
+                            prob = valid_neighbors[i][1]
+                            break
+
+            tour.append(next_node)
+            visited.add(next_node)
+            tour_prob += prob
+            current_node = next_node
+
+        # Try closing the loop
+        if len(tour) == num_nodes:
+            last_node = tour[-1]
+            first_node = tour[0]
+            closing_prob = 0.0
+            for node, prob in adj_list[last_node]:
+                if node == first_node:
+                    closing_prob = prob
+                    break
+            tour_prob += closing_prob
+
+            if tour_prob > best_tour_prob:
+                best_tour_prob = tour_prob
+                best_tour = tour
+    
+    if best_tour is None:
+        best_tour = sampling_decode(adj_list, num_nodes)
+    
+    return best_tour
+
 def beam_search_decode(adj_list, num_nodes, beam_width=5):
     """
     Beam search decoding strategy starting from node 0.
