@@ -200,8 +200,6 @@ def sampling_decode(adj_list, num_nodes):
         neighbors = adj_list[current_node]
         
         valid_neighbors = [(node, prob) for node, prob in neighbors if node not in visited]
-        if not valid_neighbors:
-            break
         
         # If there are no valid neighbors, choose the first unvisited node
         if not valid_neighbors:
@@ -340,6 +338,7 @@ def sampling_edge_decode(adj_list, num_nodes):
     tour = edges_to_tour(selected_edges, num_nodes)
     
     if len(tour) < num_nodes:
+        print("Problem with sampling edge, return to normal node sampling")
         return sampling_decode(adj_list, num_nodes)
     
     return tour

@@ -908,7 +908,7 @@ def evaluate_and_compare(model, test_instances, lkh_solutions, candidate_infos, 
         
         # Save visualization for one random instance
         if i == viz_idx and save_plot:
-            fig, ((ax1,ax2), (ax3, ax4))= plt.subplots(2, 2, figsize=(16, 16))
+            fig, ((ax1,ax2), (ax3, ax4))= plt.subplots(2, 2, figsize=(28, 16))
             plot_tour(last_coords, pfn_tour, f"PFN Tour ({decoding_strategy}, distance: {pfn_distance:.4f})", ax=ax1)
             plot_tour(last_coords, ortools_tour, f"OR-Tools Tour (distance: {ortools_distance:.4f})", ax=ax2)
             plot_tour(last_coords, pfn_or_tour, f"PFN + OR-Tools Tour (distance: {pfn_or_distance:.4f})", ax=ax3)
