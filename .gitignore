@@ -170,3 +170,9 @@ models_diff/
 pfns/priors/LKH
 pfns/priors/lkh3_temp
 /edge_prediction_results
+/scripts/monitor_and_train.sh
+/scripts/start_monitor.sh
+/scripts/stop_monitor.sh
+/scripts/run_sample_ratio_experiments.sh
+/scripts/test_sample.sh
+/scripts/train_tsp_fast.sh

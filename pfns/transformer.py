@@ -34,28 +34,20 @@ class GATPooling(nn.Module):
             
         batch_size = batch_indices.max().item() + 1 if batch_indices.numel() > 0 else 1
         
-        # Compute attention features
         attention_features = self.attention_linear(x)  # [num_edges, hidden_size]
         attention_features = torch.relu(attention_features)
         attention_features = self.dropout(attention_features)
         
-        # Compute scalar attention scores for each edge
         attention_scores = self.score_linear(attention_features)  # [num_edges, 1]
         attention_scores = attention_scores.squeeze(-1)  # [num_edges]
         
-        # Compute softmax weights and weighted sum for each batch separately
         pooled_outputs = []
         for b in range(batch_size):
             batch_mask = (batch_indices == b)
             if batch_mask.sum() > 0:
-                # Get current batch edge embeddings and attention scores
                 batch_embeddings = x[batch_mask]  # [batch_edges, hidden_size]
                 batch_scores = attention_scores[batch_mask]  # [batch_edges]
-                
-                # Compute softmax weights within batch
                 batch_weights = F.softmax(batch_scores, dim=0)  # [batch_edges]
-                
-                # Weighted sum to get graph representation
                 pooled = torch.sum(batch_embeddings * batch_weights.unsqueeze(-1), dim=0)  # [hidden_size]
                 pooled_outputs.append(pooled)
             else:
@@ -175,10 +167,6 @@ class TransformerModel(nn.Module):
 
     def init_weights(self):
         initrange = 1.
-        # if isinstance(self.encoder,EmbeddingEncoder):
-        #    self.encoder.weight.data.uniform_(-initrange, initrange)
-        # self.decoder.bias.data.zero_()
-        # self.decoder.weight.data.uniform_(-initrange, initrange)
         if self.init_method is not None:
             self.apply(self.init_method)
         for layer in self.transformer_encoder.layers:
@@ -253,16 +241,17 @@ class TransformerModel(nn.Module):
             edge_info = x_encoder_output.get('edge_info')
             x_encoded = x_encoder_output['node_embeddings']
             
-            # Check for direct predictions mode (SharedBasisFiLM)
+            # Check for direct predictions mode (SharedBasisFiLM and InstanceAwareHypergraphGNN)
             if x_encoder_output.get('direct_predictions', False):
-                # For SharedBasisFiLM mode, encoder has already done edge prediction
-                # Just return the pre-computed edge predictions and edge_info
+                # For direct prediction modes, encoder has already done edge prediction
+                # Simply return the encoder's predictions without any transformer involvement
                 edge_predictions = x_encoder_output.get('edge_predictions')
                 if edge_predictions is not None:
+                    # Direct return of encoder predictions - no transformer parameter updates
                     return edge_predictions, edge_info
                 else:
                     # Fallback if no edge predictions provided
-                    seq_eval_len = x_src.shape[0] - single_eval_pos
+                    seq_eval_len = x_src.shape[0] - (single_eval_pos or 0)
                     batch_size = x_src.shape[1]
                     dummy_predictions = torch.zeros(seq_eval_len, batch_size, 1, device=x_src.device)
                     return dummy_predictions, edge_info
@@ -276,7 +265,19 @@ class TransformerModel(nn.Module):
         if y_src is not None and self.y_encoder is not None and not encoder_supports_unified:
             y_shape_adjusted = y_src.unsqueeze(-1) if len(y_src.shape) < len(x_encoded.shape) else y_src
             if edge_info is not None:
-                edge_emb, edge_index, batch, position_tensor, node_offset_map, edge_counts = edge_info
+                # Handle both dict and tuple format for edge_info
+                if isinstance(edge_info, dict):
+                    # New dict format from TSP encoder
+                    edge_emb = edge_info.get('embeddings')
+                    edge_index = edge_info.get('indices')
+                    batch = edge_info.get('batch')
+                    position_tensor = edge_info.get('position')
+                    node_offset_map = edge_info.get('node_offset_map')
+                    edge_counts = edge_info.get('edge_counts')
+                else:
+                    # Legacy tuple format
+                    edge_emb, edge_index, batch, position_tensor, node_offset_map, edge_counts = edge_info
+                    
                 y_encoded = self.y_encoder(
                     y_shape_adjusted,
                     edge_emb=edge_emb,
@@ -342,13 +343,15 @@ class TransformerModel(nn.Module):
         output = output[out_range_start:out_range_end]
         
         # Handle unified dict format with eval_infos
-        eval_infos = edge_info.get('eval_infos', [])
+        eval_infos = edge_info.get('eval_infos', []) if edge_info else []
         if eval_infos:
             # Use structural edge information to build outputs
-            return self._build_output_from_eval_infos(output, eval_infos, single_eval_pos, x_src)
+            result = self._build_output_from_eval_infos(output, eval_infos, single_eval_pos, x_src)
         else:
             # No evaluation info available
-            return output, None
+            result = output, None
+        
+        return result
 
     def _build_output_from_eval_infos(self, output, eval_infos, single_eval_pos, x_src):
         """

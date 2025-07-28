@@ -3,6 +3,21 @@
 TSP dataset generation script with multiprocessing support
 Generates TSP instances for specified node ranges with configurable parameters
 Supports merging existing datasets
+
+STRATEGIES:
+- random_nodes_same_size: Generate random instances with same node count
+- fix_all_nodes_same_size: Use fixed node set, sample different subsets
+- fix_group_nodes_same_size: Each group has its own fixed node set
+- sample_from_large: IMPROVED - Generate base instance of target size, sample smaller subgraphs
+  * Each group has one base instance (num_nodes size) 
+  * Multiple sampled instances (sampling_ratio * num_nodes size) from the base
+  * All instances (base + sampled) are included in each group
+  * Fully parallel processing across all groups and instances for maximum efficiency
+
+MULTIPROCESSING IMPROVEMENTS:
+- sample_from_large strategy now processes ALL instances across ALL groups in parallel
+- No more sequential group processing - maximum utilization of available cores
+- Significantly faster generation for large datasets
 """
 
 import os
@@ -17,6 +32,7 @@ import multiprocessing as mp
 import glob
 from datetime import datetime
 from multiprocessing import Pool
+import hashlib
 
 # Add project path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -279,9 +295,88 @@ def generate_test_instances_with_fixed_nodes(min_nodes, max_nodes, num_instances
     return all_instances
 
 
+def generate_group_fixed_nodes_worker(args):
+    """
+    Worker function for parallel generation of group-based fixed nodes TSP instances.
+    
+    Args:
+        args: Tuple containing (num_nodes, group_idx, instances_per_group, max_candidates, alpha, min_fixed_nodes)
+    
+    Returns:
+        Tuple of (num_nodes, group_idx, instances) where instances is the list of generated TSP instances
+    """
+    num_nodes, group_idx, instances_per_group, max_candidates, alpha, min_fixed_nodes = args
+    
+    # 🔧 修复：使用安全的种子生成策略，避免种子值过大
+    # 使用哈希函数确保种子在合理范围内且分布均匀
+    
+    # 为group生成固定节点的种子
+    group_seed_str = f"group_{group_idx}_nodes_{num_nodes}_fixed"
+    group_seed_hash = hashlib.md5(group_seed_str.encode()).hexdigest()
+    group_seed = int(group_seed_hash[:8], 16) % (2**31 - 1)  # 确保在int32范围内
+    np.random.seed(group_seed)
+    
+    # Generate fixed nodes for this group
+    fixed_nodes = max(min_fixed_nodes, num_nodes + 10)  # Ensure fixed_nodes >= num_nodes
+    fixed_coords = np.random.uniform(0, 1, size=(fixed_nodes, 2))
+    
+    # Generate instances serially within this worker (no nested multiprocessing)
+    instances = []
+    for i in range(instances_per_group):
+        # 🔧 修复：为每个instance生成独特的种子
+        inst_seed_str = f"group_{group_idx}_nodes_{num_nodes}_inst_{i}"
+        inst_seed_hash = hashlib.md5(inst_seed_str.encode()).hexdigest()
+        inst_seed = int(inst_seed_hash[:8], 16) % (2**31 - 1)  # 确保在int32范围内
+        np.random.seed(inst_seed)
+        
+        # Randomly select subset of fixed nodes
+        if fixed_nodes > num_nodes:
+            selected_indices = np.random.choice(fixed_nodes, num_nodes, replace=False)
+            coords = fixed_coords[selected_indices]
+        else:
+            coords = fixed_coords[:num_nodes]
+        
+        try:
+            # Solve TSP for this instance
+            tour, candidate_info = solve_tsp_lkh3(coords, max_candidates=max_candidates, alpha=alpha)
+            
+            # Create instance dictionary
+            instance = {
+                'coords': coords,
+                'tour': tour,
+                'candidate_info': candidate_info,
+                'num_nodes': num_nodes,
+                'instance_id': group_idx * instances_per_group + i,
+                'group_id': group_idx
+            }
+            instances.append(instance)
+            
+        except Exception as e:
+            print(f"Failed to generate instance {i} in group {group_idx} for TSP-{num_nodes}: {e}")
+            # Create fallback instance
+            fallback_tour = list(range(num_nodes))
+            fallback_candidate_info = {
+                'dimension': num_nodes,
+                'candidates': {},
+                'mst_parents': {}
+            }
+            instance = {
+                'coords': coords,
+                'tour': fallback_tour,
+                'candidate_info': fallback_candidate_info,
+                'num_nodes': num_nodes,
+                'instance_id': group_idx * instances_per_group + i,
+                'group_id': group_idx
+            }
+            instances.append(instance)
+    
+    return num_nodes, group_idx, instances
+
+
 def generate_tsp_instances_with_group_fixed_nodes(min_nodes, max_nodes, num_instances, max_candidates=5, alpha=None, num_processes=16, min_fixed_nodes=None, instances_per_group=100):
     """
     Generate TSP instances where each node size has multiple groups, each with its own fixed set of nodes.
+    Uses parallel processing to speed up generation while preserving all original logic.
     
     Args:
         min_nodes: Minimum number of nodes in TSP instances
@@ -304,33 +399,78 @@ def generate_tsp_instances_with_group_fixed_nodes(min_nodes, max_nodes, num_inst
     if min_fixed_nodes is None:
         min_fixed_nodes = max(instances_per_group + 10, max_nodes)
     
-    # Generate instances for each node count
-    all_instances = {}
+    print(f"Generating TSP instances with group fixed nodes using {num_processes} processes...")
+    print(f"Node range: {min_nodes}-{max_nodes}, Groups per node size: {num_groups}, Instances per group: {instances_per_group}")
+    
+    # Prepare all work items for parallel processing
+    work_items = []
     for num_nodes in range(min_nodes, max_nodes + 1):
-        print(f"\nGenerating {num_instances} instances for TSP-{num_nodes} ({num_groups} groups)...")
+        for group_idx in range(num_groups):
+            work_items.append((num_nodes, group_idx, instances_per_group, max_candidates, alpha, min_fixed_nodes))
+    
+    print(f"Total work items: {len(work_items)} (processing groups in parallel)")
+    
+    # Process all work items in parallel with progress bar
+    all_instances = {}
+    
+    # Initialize result structure
+    for num_nodes in range(min_nodes, max_nodes + 1):
+        all_instances[num_nodes] = [[] for _ in range(num_groups)]
+    
+    # Process all work items in parallel with real-time progress updates
+    results = []
+    completed_count = 0
+    
+    def update_progress(result):
+        """Callback function to update progress in real-time"""
+        nonlocal completed_count
+        results.append(result)
+        completed_count += 1
+        pbar.update(1)
+    
+    def error_callback(error):
+        """Callback function to handle errors"""
+        print(f"Error in worker: {error}")
+        pbar.update(1)
+    
+    with mp.Pool(processes=num_processes) as pool:
+        # Initialize progress bar
+        pbar = tqdm(total=len(work_items), desc="Generating groups", ncols=100)
         
-        # Generate instances for each group
+        # Submit all work items with callback
+        async_results = []
+        for work_item in work_items:
+            async_result = pool.apply_async(
+                generate_group_fixed_nodes_worker,
+                args=(work_item,),
+                callback=update_progress,
+                error_callback=error_callback
+            )
+            async_results.append(async_result)
+        
+        # Wait for all tasks to complete
+        for async_result in async_results:
+            async_result.wait()
+        
+        pbar.close()
+    
+    # Organize results back into the expected structure
+    for num_nodes, group_idx, instances in results:
+        all_instances[num_nodes][group_idx] = instances
+        
+    # Flatten group structure to maintain original output format
+    final_instances = {}
+    for num_nodes in range(min_nodes, max_nodes + 1):
         group_instances = []
         for group_idx in range(num_groups):
-            print(f"  Group {group_idx + 1}/{num_groups}:")
-            
-            # Generate fixed nodes for this group
-            fixed_nodes = max(min_fixed_nodes, num_nodes + 10)  # Ensure fixed_nodes >= num_nodes
-            print(f"    Using {fixed_nodes} fixed nodes for group {group_idx + 1}")
-            fixed_coords = np.random.uniform(0, 1, size=(fixed_nodes, 2))
-            
-            # Generate instances using these fixed nodes
-            instances = generate_single_instance_with_fixed_nodes(
-                num_nodes, instances_per_group, fixed_coords,
-                max_candidates, alpha, num_processes
-            )
+            instances = all_instances[num_nodes][group_idx]
             group_instances.extend(instances)
-            print(f"    Generated {len(instances)} instances for group {group_idx + 1}")
+            print(f"  Generated {len(instances)} instances for TSP-{num_nodes} group {group_idx + 1}")
         
-        all_instances[num_nodes] = group_instances
+        final_instances[num_nodes] = group_instances
         print(f"Total: Generated {len(group_instances)} instances for TSP-{num_nodes}")
     
-    return all_instances
+    return final_instances
 
 
 def generate_test_instances_with_group_fixed_nodes(min_nodes, max_nodes, test_instances, max_candidates=5, alpha=None, num_processes=16, min_fixed_nodes=None, train_instances=None, test_instances_multiplier=5, instances_per_group=100):
@@ -371,7 +511,7 @@ def generate_test_instances_with_group_fixed_nodes(min_nodes, max_nodes, test_in
             print(f"  Group {group_idx + 1}/{num_groups}:")
             
             # Generate fixed nodes for this group
-            fixed_nodes = max(min_fixed_nodes, num_nodes + 10)  # Ensure fixed_nodes >= num_nodes
+            fixed_nodes = max(int(num_nodes * 1.4), num_nodes + 10)  # Ensure fixed_nodes >= num_nodes
             print(f"    Using {fixed_nodes} fixed nodes for group {group_idx + 1}")
             fixed_coords = np.random.uniform(0, 1, size=(fixed_nodes, 2))
             
@@ -403,6 +543,94 @@ def generate_test_instances_with_group_fixed_nodes(min_nodes, max_nodes, test_in
     return all_instances
 
 
+def generate_covering_samples(num_nodes, sample_size, num_samples):
+    """
+    Generate multiple samples from a base instance, ensuring all base nodes are covered.
+    Uses a greedy coverage strategy to guarantee that every node appears in at least one sample.
+    
+    Args:
+        num_nodes: Total number of nodes in the base instance
+        sample_size: Number of nodes in each sample
+        num_samples: Number of samples to generate
+        
+    Returns:
+        List of numpy arrays, each containing indices for one sample
+    """
+    if sample_size * num_samples < num_nodes:
+        print(f"Warning: Total sample capacity ({sample_size} * {num_samples} = {sample_size * num_samples}) "
+              f"is less than base nodes ({num_nodes}). Some nodes may not be covered.")
+    
+    # Track which nodes have been covered
+    uncovered_nodes = set(range(num_nodes))
+    all_samples = []
+    
+    for sample_idx in range(num_samples):
+        sample_indices = []
+        
+        # Determine how many uncovered nodes to include in this sample
+        remaining_samples = num_samples - sample_idx
+        remaining_uncovered = len(uncovered_nodes)
+        
+        if remaining_uncovered > 0:
+            # Calculate how many uncovered nodes to include in this sample
+            # Distribute uncovered nodes roughly evenly across remaining samples
+            uncovered_to_include = min(
+                sample_size,
+                max(1, remaining_uncovered // remaining_samples),
+                remaining_uncovered
+            )
+            
+            # If this is the last sample, include all remaining uncovered nodes
+            if sample_idx == num_samples - 1:
+                uncovered_to_include = min(sample_size, remaining_uncovered)
+            
+            # Select uncovered nodes for this sample
+            if uncovered_to_include > 0:
+                selected_uncovered = np.random.choice(
+                    list(uncovered_nodes), 
+                    size=uncovered_to_include, 
+                    replace=False
+                )
+                sample_indices.extend(selected_uncovered)
+                # Remove selected nodes from uncovered set
+                uncovered_nodes -= set(selected_uncovered)
+        
+        # Fill remaining positions with random nodes (can be already covered)
+        remaining_positions = sample_size - len(sample_indices)
+        if remaining_positions > 0:
+            # Choose from all nodes except those already in this sample
+            available_nodes = [i for i in range(num_nodes) if i not in sample_indices]
+            if len(available_nodes) >= remaining_positions:
+                additional_nodes = np.random.choice(
+                    available_nodes, 
+                    size=remaining_positions, 
+                    replace=False
+                )
+                sample_indices.extend(additional_nodes)
+            else:
+                # If not enough available nodes, fill with what we have
+                sample_indices.extend(available_nodes)
+        
+        # Convert to numpy array and sort for consistency
+        sample_indices = np.array(sample_indices)
+        sample_indices = np.sort(sample_indices)
+        all_samples.append(sample_indices)
+    
+    # Verify coverage
+    covered_nodes = set()
+    for sample in all_samples:
+        covered_nodes.update(sample)
+    
+    coverage_rate = len(covered_nodes) / num_nodes
+    print(f"    Coverage: {len(covered_nodes)}/{num_nodes} nodes ({coverage_rate:.1%})")
+    
+    if len(covered_nodes) < num_nodes:
+        missing_nodes = set(range(num_nodes)) - covered_nodes
+        print(f"    Warning: {len(missing_nodes)} nodes not covered: {sorted(missing_nodes)}")
+    
+    return all_samples
+
+
 def generate_subgraph_from_large_instance(large_coords, num_nodes):
     """
     Generate a subgraph from a larger instance by sampling nodes.
@@ -429,11 +657,11 @@ def generate_tsp_instances_from_large(min_nodes, max_nodes, num_instances, sampl
     """
     Generate TSP instances by sampling from large base instances.
     Each node size has multiple groups, each with its own base instance.
-    The base instance is included as the last instance in each group.
+    The base instance and sampled instances are all included in each group.
     
     Args:
-        min_nodes: Minimum number of nodes in TSP instances (also minimum base instance size)
-        max_nodes: Maximum number of nodes in TSP instances (also maximum base instance size)
+        min_nodes: Minimum number of nodes in TSP instances (base instance size)
+        max_nodes: Maximum number of nodes in TSP instances (base instance size)
         num_instances: Total number of instances to generate for each node count
         sampling_ratio: Ratio of nodes to sample from base instance (must be < 1.0)
         max_candidates: Maximum number of candidates per node for LKH3
@@ -457,75 +685,107 @@ def generate_tsp_instances_from_large(min_nodes, max_nodes, num_instances, sampl
     for num_nodes in range(min_nodes, max_nodes + 1):
         print(f"\nGenerating {num_instances} instances for TSP-{num_nodes} ({num_groups} groups)...")
         
-        # Generate instances for each group
-        group_instances = []
-        for group_idx in range(num_groups):
-            print(f"  Group {group_idx + 1}/{num_groups}:")
-            
-            # Generate base instance for this group
-            base_nodes = num_nodes  # Base instance size equals target node count
-            print(f"    Using base instance with {base_nodes} nodes for group {group_idx + 1}")
-            base_coords = np.random.uniform(0, 1, size=(base_nodes, 2))
-            
-            # First, solve the base instance
-            base_tour, base_candidate_info = solve_tsp_lkh3(base_coords, max_candidates=max_candidates, alpha=alpha)
-            base_instance = {
-                'coords': base_coords,
-                'tour': base_tour,
-                'candidate_info': base_candidate_info,
-                'is_base': True  # Mark as base instance
-            }
-            
-            # Prepare arguments for parallel processing (sampled instances)
-            args_list = []
-            sampled_coords_list = []  # Store sampled coordinates for each instance
-            for i in range(instances_per_group - 1):  # -1 because we'll add base instance
-                # Sample nodes from base instance
-                sample_size = max(2, round(sampling_ratio * base_nodes))
-                sampled_indices = np.random.choice(base_nodes, sample_size, replace=False)
-                sampled_coords = base_coords[sampled_indices]
-                args_list.append((sampled_coords, max_candidates, alpha))
-                sampled_coords_list.append(sampled_coords)
-            
-            # Generate sampled instances in parallel
-            if args_list:  # Only if we have sampled instances to generate
-                with Pool(num_processes) as pool:
-                    results = list(tqdm(
-                        pool.starmap(solve_tsp_lkh3, args_list),
-                        total=len(args_list),
-                        desc=f"    Generating sampled instances for group {group_idx + 1}",
-                        ncols=100
-                    ))
-                
-                # Process sampled results
-                for i, ((tour, candidate_info), sampled_coords) in enumerate(zip(results, sampled_coords_list)):
-                    group_instances.append({
-                        'coords': sampled_coords,
-                        'tour': tour,
-                        'candidate_info': candidate_info,
-                        'is_base': False  # Mark as sampled instance
-                    })
-            
-            # Add base instance to the group
-            group_instances.append(base_instance)
-            
-            print(f"    Generated {len(args_list)} sampled instances + 1 base instance for group {group_idx + 1}")
+        # Step 1: Prepare all work (base instances + sampled coordinates) for all groups
+        all_work_items = []
+        base_instances_info = []
         
-        all_instances[num_nodes] = group_instances
-        print(f"Total: Generated {len(group_instances)} instances for TSP-{num_nodes}")
+        for group_idx in range(num_groups):
+            # Generate base instance coordinates for this group
+            base_coords = np.random.uniform(0, 1, size=(num_nodes, 2))
+            
+            # Add base instance to work items
+            all_work_items.append((base_coords, max_candidates, alpha, group_idx, 'base'))
+            base_instances_info.append((group_idx, base_coords))
+            
+            # Generate sampled coordinates from base instance with coverage guarantee
+            sample_size = max(2, round(sampling_ratio * num_nodes))
+            num_sampled_instances = instances_per_group - 1  # -1 because base instance is already added
+            
+            # Use greedy coverage strategy to ensure all base nodes are covered
+            sampled_indices_list = generate_covering_samples(
+                num_nodes, sample_size, num_sampled_instances
+            )
+            
+            for i, sampled_indices in enumerate(sampled_indices_list):
+                sampled_coords = base_coords[sampled_indices]
+                all_work_items.append((sampled_coords, max_candidates, alpha, group_idx, f'sampled_{i}'))
+        
+        print(f"  Prepared {len(all_work_items)} work items ({num_groups} base + {len(all_work_items) - num_groups} sampled)")
+        
+        # Step 2: Process all work items in parallel
+        print(f"  Processing all instances in parallel with {num_processes} processes...")
+        with Pool(num_processes) as pool:
+            results = list(tqdm(
+                pool.starmap(solve_tsp_lkh3_with_metadata, 
+                           [(coords, max_candidates, alpha, group_idx, instance_type) 
+                            for coords, max_candidates, alpha, group_idx, instance_type in all_work_items]),
+                total=len(all_work_items),
+                desc=f"  Generating all TSP-{num_nodes} instances",
+                ncols=100
+            ))
+        
+        # Step 3: Organize results by groups
+        group_results = {}
+        for (tour, candidate_info, group_idx, instance_type), (coords, _, _, _, _) in zip(results, all_work_items):
+            if group_idx not in group_results:
+                group_results[group_idx] = []
+            
+            instance = {
+                'coords': coords,
+                'tour': tour,
+                'candidate_info': candidate_info,
+                'is_base': (instance_type == 'base'),
+                'group_id': group_idx,
+                'instance_type': instance_type
+            }
+            group_results[group_idx].append(instance)
+        
+        # Step 4: Create groups with proper structure (same as test data)
+        groups = []
+        for group_idx in range(num_groups):
+            if group_idx in group_results:
+                # Sort instances: base instance first, then sampled instances
+                group_instances_sorted = sorted(group_results[group_idx], 
+                                              key=lambda x: (0 if x['is_base'] else 1, x['instance_type']))
+                groups.append(group_instances_sorted)
+                print(f"  Group {group_idx + 1}: {len(group_results[group_idx])} instances")
+        
+        all_instances[num_nodes] = groups  # Return grouped structure, not flattened
+        print(f"Total: Generated {len(groups)} groups for TSP-{num_nodes}")
     
     return all_instances
+
+
+def solve_tsp_lkh3_with_metadata(coords, max_candidates, alpha, group_idx, instance_type):
+    """
+    Wrapper function for solve_tsp_lkh3 that includes metadata.
+    Used for parallel processing with additional information.
+    """
+    try:
+        tour, candidate_info = solve_tsp_lkh3(coords, max_candidates=max_candidates, alpha=alpha)
+        return tour, candidate_info, group_idx, instance_type
+    except Exception as e:
+        print(f"Warning: Failed to solve TSP for group {group_idx}, {instance_type}: {e}")
+        # Return fallback solution
+        num_nodes = len(coords)
+        fallback_tour = list(range(num_nodes))
+        fallback_candidate_info = {
+            'dimension': num_nodes,
+            'candidates': {},
+            'mst_parents': {}
+        }
+        return fallback_tour, fallback_candidate_info, group_idx, instance_type
 
 
 def generate_test_instances_from_large(min_nodes, max_nodes, test_instances, sampling_ratio, max_candidates=5, alpha=None, num_processes=16, test_instances_multiplier=5, instances_per_group=100):
     """
     Generate test TSP instances by sampling from large base instances.
     Each node size has multiple groups, each with its own base instance.
-    The base instance is included as the last instance in each group.
+    The base instance and sampled instances are all included in each group.
     
     Args:
-        min_nodes: Minimum number of nodes in TSP instances (also minimum base instance size)
-        max_nodes: Maximum number of nodes in TSP instances (also maximum base instance size)
+        min_nodes: Minimum number of nodes in TSP instances (base instance size)
+        max_nodes: Maximum number of nodes in TSP instances (base instance size)
         test_instances: Total number of test instances to generate for each node count
         sampling_ratio: Ratio of nodes to sample from base instance (must be < 1.0)
         max_candidates: Maximum number of candidates per node for LKH3
@@ -550,66 +810,80 @@ def generate_test_instances_from_large(min_nodes, max_nodes, test_instances, sam
     for num_nodes in range(min_nodes, max_nodes + 1):
         print(f"\nGenerating test instances for TSP-{num_nodes} ({num_groups} groups)...")
         
-        # Generate groups for this node count
+        # Step 1: Prepare all work (base instances + sampled coordinates) for all groups
+        all_work_items = []
+        base_instances_info = []
+        
+        for group_idx in range(num_groups):
+            # Generate base instance coordinates for this group
+            base_coords = np.random.uniform(0, 1, size=(num_nodes, 2))
+            
+            # Add base instance to work items
+            all_work_items.append((base_coords, max_candidates, alpha, group_idx, 'base'))
+            base_instances_info.append((group_idx, base_coords))
+            
+            # Generate extra sampled instances (with multiplier for testing) using coverage strategy
+            extra_instances = int(instances_per_group * test_instances_multiplier * 1.2)  # Generate 20% more instances
+            sample_size = max(2, round(sampling_ratio * num_nodes))
+            
+            # Use greedy coverage strategy for test instances as well
+            sampled_indices_list = generate_covering_samples(
+                num_nodes, sample_size, extra_instances
+            )
+            
+            for i, sampled_indices in enumerate(sampled_indices_list):
+                sampled_coords = base_coords[sampled_indices]
+                all_work_items.append((sampled_coords, max_candidates, alpha, group_idx, f'sampled_{i}'))
+        
+        print(f"  Prepared {len(all_work_items)} work items ({num_groups} base + {len(all_work_items) - num_groups} sampled)")
+        
+        # Step 2: Process all work items in parallel
+        print(f"  Processing all test instances in parallel with {num_processes} processes...")
+        with Pool(num_processes) as pool:
+            results = list(tqdm(
+                pool.starmap(solve_tsp_lkh3_with_metadata, 
+                           [(coords, max_candidates, alpha, group_idx, instance_type) 
+                            for coords, max_candidates, alpha, group_idx, instance_type in all_work_items]),
+                total=len(all_work_items),
+                desc=f"  Generating all test TSP-{num_nodes} instances",
+                ncols=100
+            ))
+        
+        # Step 3: Organize results by groups
+        group_results = {}
+        for (tour, candidate_info, group_idx, instance_type), (coords, _, _, _, _) in zip(results, all_work_items):
+            if group_idx not in group_results:
+                group_results[group_idx] = []
+            
+            instance = {
+                'coords': coords,
+                'tour': tour,
+                'candidate_info': candidate_info,
+                'is_base': (instance_type == 'base'),
+                'group_id': group_idx,
+                'instance_type': instance_type
+            }
+            group_results[group_idx].append(instance)
+        
+        # Step 4: Create groups with proper instance counts
         groups = []
         for group_idx in range(num_groups):
-            print(f"  Group {group_idx + 1}/{num_groups}:")
-            
-            # Generate base instance for this group
-            base_nodes = num_nodes  # Base instance size equals target node count
-            print(f"    Using base instance with {base_nodes} nodes for group {group_idx + 1}")
-            base_coords = np.random.uniform(0, 1, size=(base_nodes, 2))
-            
-            # First, solve the base instance
-            base_tour, base_candidate_info = solve_tsp_lkh3(base_coords, max_candidates=max_candidates, alpha=alpha)
-            base_instance = {
-                'coords': base_coords,
-                'tour': base_tour,
-                'candidate_info': base_candidate_info,
-                'is_base': True  # Mark as base instance
-            }
-            
-            # Generate sampled instances from the base
-            extra_instances = int(instances_per_group * test_instances_multiplier * 1.2)  # Generate 20% more instances
-            
-            # Prepare arguments for parallel processing
-            args_list = []
-            sampled_coords_list = []
-            for i in range(extra_instances):
-                # Sample nodes from base instance
-                sample_size = max(2, round(sampling_ratio * base_nodes))
-                sampled_indices = np.random.choice(base_nodes, sample_size, replace=False)
-                sampled_coords = base_coords[sampled_indices]
-                args_list.append((sampled_coords, max_candidates, alpha))
-                sampled_coords_list.append(sampled_coords)
-            
-            # Generate instances in parallel
-            with Pool(num_processes) as pool:
-                results = list(tqdm(
-                    pool.starmap(solve_tsp_lkh3, args_list),
-                    total=len(args_list),
-                    desc=f"    Generating sampled instances for group {group_idx + 1}",
-                    ncols=100
-                ))
-            
-            # Process sampled results
-            sampled_instances = []
-            for i, ((tour, candidate_info), sampled_coords) in enumerate(zip(results, sampled_coords_list)):
-                sampled_instances.append({
-                    'coords': sampled_coords,
-                    'tour': tour,
-                    'candidate_info': candidate_info,
-                    'is_base': False  # Mark as sampled instance
-                })
-            
-            # Take the required number of sampled instances
-            sampled_instances = sampled_instances[:instances_per_group * test_instances_multiplier]
-            
-            # Create group with sampled instances + base instance at the end
-            group = sampled_instances + [base_instance]
-            groups.append(group)
-            
-            print(f"    Generated {len(sampled_instances)} sampled instances + 1 base instance for group {group_idx + 1}")
+            if group_idx in group_results:
+                group_instances = group_results[group_idx]
+                
+                # Separate base and sampled instances
+                base_instances = [inst for inst in group_instances if inst['is_base']]
+                sampled_instances = [inst for inst in group_instances if not inst['is_base']]
+                
+                # Take the required number of sampled instances
+                required_sampled = instances_per_group * test_instances_multiplier - len(base_instances)
+                sampled_instances = sampled_instances[:required_sampled]
+                
+                # Create group: base instance first, then sampled instances
+                group = base_instances + sampled_instances
+                groups.append(group)
+                
+                print(f"  Group {group_idx + 1}: {len(base_instances)} base + {len(sampled_instances)} sampled = {len(group)} total instances")
         
         all_instances[num_nodes] = groups
         print(f"Total: Generated {len(groups)} groups for TSP-{num_nodes}")
@@ -756,18 +1030,41 @@ def merge_datasets(dataset_paths, output_path, generation_strategy):
     for num_nodes in sorted(merged_dataset.keys()):
         instances = merged_dataset[num_nodes]
         avg_edges = 0
-        if instances and instances[0]['candidate_info']:
+        total_instances_count = 0
+        
+        # Check if this is group-based format or flat format
+        if len(instances) > 0 and isinstance(instances[0], list):
+            # Group-based format: instances = [[group1], [group2], ...]
+            total_instances_count = sum(len(group) for group in instances)
+            
+            # Calculate average edges from all instances
             total_edges = 0
             valid_count = 0
-            for inst in instances:
-                if inst['candidate_info'] and 'candidates' in inst['candidate_info']:
-                    inst_edges = sum(len(candidates) for candidates in inst['candidate_info']['candidates'].values())
-                    total_edges += inst_edges
-                    valid_count += 1
+            for group in instances:
+                for inst in group:
+                    if isinstance(inst, dict) and inst.get('candidate_info') and 'candidates' in inst['candidate_info']:
+                        inst_edges = sum(len(candidates) for candidates in inst['candidate_info']['candidates'].values())
+                        total_edges += inst_edges
+                        valid_count += 1
             if valid_count > 0:
                 avg_edges = total_edges / valid_count
-        
-        print(f"  TSP-{num_nodes}: {len(instances)} instances, avg edges: {avg_edges:.1f}")
+                
+            print(f"  TSP-{num_nodes}: {len(instances)} groups, {total_instances_count} total instances, avg edges: {avg_edges:.1f}")
+        else:
+            # Flat format: instances = [instance1, instance2, ...]
+            total_instances_count = len(instances)
+            if instances and isinstance(instances[0], dict) and instances[0].get('candidate_info'):
+                total_edges = 0
+                valid_count = 0
+                for inst in instances:
+                    if isinstance(inst, dict) and inst.get('candidate_info') and 'candidates' in inst['candidate_info']:
+                        inst_edges = sum(len(candidates) for candidates in inst['candidate_info']['candidates'].values())
+                        total_edges += inst_edges
+                        valid_count += 1
+                if valid_count > 0:
+                    avg_edges = total_edges / valid_count
+            
+            print(f"  TSP-{num_nodes}: {total_instances_count} instances, avg edges: {avg_edges:.1f}")
     
     return merged_dataset
 
@@ -889,18 +1186,41 @@ def main():
         for num_nodes in sorted(dataset.keys()):
             instances = dataset[num_nodes]
             avg_edges = 0
-            if instances and instances[0]['candidate_info']:
+            total_instances_count = 0
+            
+            # Check if this is group-based format or flat format
+            if len(instances) > 0 and isinstance(instances[0], list):
+                # Group-based format: instances = [[group1], [group2], ...]
+                total_instances_count = sum(len(group) for group in instances)
+                
+                # Calculate average edges from all instances
                 total_edges = 0
                 valid_count = 0
-                for inst in instances:
-                    if inst['candidate_info'] and 'candidates' in inst['candidate_info']:
-                        inst_edges = sum(len(candidates) for candidates in inst['candidate_info']['candidates'].values())
-                        total_edges += inst_edges
-                        valid_count += 1
+                for group in instances:
+                    for inst in group:
+                        if isinstance(inst, dict) and inst.get('candidate_info') and 'candidates' in inst['candidate_info']:
+                            inst_edges = sum(len(candidates) for candidates in inst['candidate_info']['candidates'].values())
+                            total_edges += inst_edges
+                            valid_count += 1
                 if valid_count > 0:
                     avg_edges = total_edges / valid_count
-            
-            print(f"  TSP-{num_nodes}: {len(instances)} instances, avg edges: {avg_edges:.1f}")
+                    
+                print(f"  TSP-{num_nodes}: {len(instances)} groups, {total_instances_count} total instances, avg edges: {avg_edges:.1f}")
+            else:
+                # Flat format: instances = [instance1, instance2, ...]
+                total_instances_count = len(instances)
+                if instances and isinstance(instances[0], dict) and instances[0].get('candidate_info'):
+                    total_edges = 0
+                    valid_count = 0
+                    for inst in instances:
+                        if isinstance(inst, dict) and inst.get('candidate_info') and 'candidates' in inst['candidate_info']:
+                            inst_edges = sum(len(candidates) for candidates in inst['candidate_info']['candidates'].values())
+                            total_edges += inst_edges
+                            valid_count += 1
+                    if valid_count > 0:
+                        avg_edges = total_edges / valid_count
+                
+                print(f"  TSP-{num_nodes}: {total_instances_count} instances, avg edges: {avg_edges:.1f}")
     
     print("\nTest dataset statistics:")
     for num_nodes in sorted(test_dataset.keys()):

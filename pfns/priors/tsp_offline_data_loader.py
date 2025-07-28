@@ -102,7 +102,34 @@ class TSPOfflineDataLoader(PriorDataLoader):
     
     def _calculate_num_steps(self) -> int:
         """Calculate number of steps per epoch based on data size"""
-        total_instances = sum(len(instances) for instances in self.dataset.values())
+        if self.generation_strategy == 'sample_from_large':
+            # For sample_from_large, count actual groups available
+            total_groups = 0
+            for num_nodes, instances in self.dataset.items():
+                if len(instances) > 0 and isinstance(instances[0], list):
+                    # Already grouped format
+                    total_groups += len(instances)
+                else:
+                    # Flat format - check if has group_id
+                    has_group_id = len(instances) > 0 and isinstance(instances[0], dict) and 'group_id' in instances[0]
+                    
+                    if has_group_id:
+                        # Count unique group_ids
+                        group_ids = set(inst['group_id'] for inst in instances)
+                        total_groups += len(group_ids)
+                    else:
+                        # No group_id - create artificial groups
+                        instances_per_group = self.seq_len_maximum
+                        num_groups = len(instances) // instances_per_group
+                        total_groups += num_groups
+            
+            # Calculate steps considering batch_size
+            steps = max(1, total_groups // self.batch_size)
+            print(f"sample_from_large: {total_groups} total groups, batch_size={self.batch_size}, steps={steps}")
+            return steps
+        else:
+            # Original logic for other strategies
+            total_instances = sum(len(instances) for instances in self.dataset.values())
         # Each step processes seq_len_maximum * batch_size instances
         instances_per_step = self.seq_len_maximum * self.batch_size
         steps = max(1, total_instances // instances_per_step)
@@ -117,11 +144,28 @@ class TSPOfflineDataLoader(PriorDataLoader):
         available_nodes = list(self.dataset.keys())
         test_num_nodes = available_nodes[len(available_nodes) // 2]
         
+        # Get test instances based on generation strategy
+        if self.generation_strategy == 'sample_from_large':
+            # For sample_from_large, data is in group format
+            groups = self.dataset[test_num_nodes]
+            if len(groups) > 0 and isinstance(groups[0], list):
+                # Extract instances from first group
+                test_instances = groups[0][:self.seq_len_maximum * self.batch_size]
+            else:
+                # Fallback if format is unexpected
+                test_instances = []
+                for i, group in enumerate(groups):
+                    if isinstance(group, list):
+                        test_instances.extend(group)
+                    if len(test_instances) >= self.seq_len_maximum * self.batch_size:
+                        break
+                test_instances = test_instances[:self.seq_len_maximum * self.batch_size]
+        else:
+            # For other strategies, data is already flat format
+            test_instances = self.dataset[test_num_nodes][:self.seq_len_maximum * self.batch_size]
+        
         # Generate test batch
-        x, y, candidate_info = self._create_batch_from_instances(
-            self.dataset[test_num_nodes][:self.seq_len_maximum * self.batch_size],
-            test_num_nodes
-        )
+        x, y, candidate_info = self._create_batch_from_instances(test_instances, test_num_nodes)
         
         # Sample single evaluation position
         single_eval_pos, _ = self.eval_pos_seq_len_sampler()
@@ -202,52 +246,221 @@ class TSPOfflineDataLoader(PriorDataLoader):
     
     def _iter_group_based(self):
         """Iterator for fix_group_nodes_same_size and sample_from_large strategies"""
-        # Create group pools for each node count
-        group_pools = {}
-        for num_nodes, instances in self.dataset.items():
-            num_groups = len(instances) // (self.seq_len_maximum * self.batch_size)
-            groups = [instances[i:i + self.seq_len_maximum * self.batch_size] 
-                     for i in range(0, len(instances), self.seq_len_maximum * self.batch_size)]
-            if self.shuffle:
-                random.shuffle(groups) 
-            group_pools[num_nodes] = groups
-        
-        # Track current group in each pool
-        group_positions = {num_nodes: 0 for num_nodes in group_pools.keys()}
-        
-        for step in range(self.num_steps):
-            # Randomly select a node count for this batch
-            available_nodes = [num_nodes for num_nodes, pos in group_positions.items() 
-                             if pos < len(group_pools[num_nodes])]
+        if self.generation_strategy == 'sample_from_large':
+            # Special handling for sample_from_large strategy
+            yield from self._iter_sample_from_large()
+        else:
+            # Original logic for other group-based strategies
+            # Create group pools for each node count
+            group_pools = {}
+            for num_nodes, instances in self.dataset.items():
+                num_groups = len(instances) // (self.seq_len_maximum * self.batch_size)
+                groups = [instances[i:i + self.seq_len_maximum * self.batch_size] 
+                         for i in range(0, len(instances), self.seq_len_maximum * self.batch_size)]
+                if self.shuffle:
+                    random.shuffle(groups) 
+                group_pools[num_nodes] = groups
             
-            if not available_nodes:
-                # Reset pools if all are exhausted
-                for num_nodes in group_pools.keys():
-                    if self.shuffle:
-                        random.shuffle(group_pools[num_nodes])
-                    group_positions[num_nodes] = 0
-                available_nodes = list(group_pools.keys())
+            # Track current group in each pool
+            group_positions = {num_nodes: 0 for num_nodes in group_pools.keys()}
             
-            current_num_nodes = random.choice(available_nodes)
-            
-            # Get group for this batch
-            groups = group_pools[current_num_nodes]
-            current_group = groups[group_positions[current_num_nodes]]
-            group_positions[current_num_nodes] += 1
-            
-            # Create batch tensors
-            x, y, candidate_info = self._create_batch_from_instances(current_group, current_num_nodes)
-            
-            # For sample_from_large strategy, always evaluate the last instance
-            if self.generation_strategy == 'sample_from_large':
-                single_eval_pos = self.seq_len_maximum - 1
-            else:
-                # For other strategies, sample evaluation position
+            for step in range(self.num_steps):
+                # Randomly select a node count for this batch
+                available_nodes = [num_nodes for num_nodes, pos in group_positions.items() 
+                                 if pos < len(group_pools[num_nodes])]
+                
+                if not available_nodes:
+                    # Reset pools if all are exhausted
+                    for num_nodes in group_pools.keys():
+                        if self.shuffle:
+                            random.shuffle(group_pools[num_nodes])
+                        group_positions[num_nodes] = 0
+                    available_nodes = list(group_pools.keys())
+                
+                current_num_nodes = random.choice(available_nodes)
+                
+                # Get group for this batch
+                groups = group_pools[current_num_nodes]
+                current_group = groups[group_positions[current_num_nodes]]
+                group_positions[current_num_nodes] += 1
+                
+                # Create batch tensors
+                x, y, candidate_info = self._create_batch_from_instances(current_group, current_num_nodes)
+                
+                # Sample evaluation position
                 single_eval_pos, _ = self.eval_pos_seq_len_sampler()
                 single_eval_pos = min(single_eval_pos, self.seq_len_maximum - 1)
+                
+                yield Batch(x=x, y=y, target_y=y, candidate_info=candidate_info,
+                           style=None, single_eval_pos=single_eval_pos)
+    
+    def _iter_sample_from_large(self):
+        """Special iterator for sample_from_large strategy"""
+        print("Using sample_from_large strategy with base map as target")
+        
+        # First, detect data structure format and reorganize if needed
+        all_groups = []
+        for num_nodes, instances in self.dataset.items():
+            if len(instances) > 0 and isinstance(instances[0], list):
+                for group_idx, group in enumerate(instances):
+                    if len(group) > 0:
+                        all_groups.append((num_nodes, group_idx, group))
+            else:
+                has_group_id = len(instances) > 0 and isinstance(instances[0], dict) and 'group_id' in instances[0]
+                
+                if has_group_id:
+                    groups_dict = {}
+                    for instance in instances:
+                        group_id = instance.get('group_id', 0)
+                        if group_id not in groups_dict:
+                            groups_dict[group_id] = []
+                        groups_dict[group_id].append(instance)
+                    
+                    for group_id, group in groups_dict.items():
+                        if len(group) > 0:
+                            all_groups.append((num_nodes, group_id, group))
+                else:
+                    instances_per_group = self.seq_len_maximum  
+                    num_groups = len(instances) // instances_per_group
+                    
+                    for group_idx in range(num_groups):
+                        start_idx = group_idx * instances_per_group
+                        end_idx = min(start_idx + instances_per_group, len(instances))
+                        group = instances[start_idx:end_idx]
+                        if len(group) > 0:
+                            all_groups.append((num_nodes, group_idx, group))
+                    
+                    print(f"  Created {num_groups} artificial groups of size ~{instances_per_group}")
+        
+        if self.shuffle:
+            random.shuffle(all_groups)
+        
+        if len(all_groups) == 0:
+            print("No groups available for sample_from_large strategy")
+            return
+        
+        # Generate batches
+        group_idx = 0
+        for step in range(self.num_steps):
+            # Create one batch with batch_size sequences
+            batch_sequences = []
             
-            yield Batch(x=x, y=y, target_y=y, candidate_info=candidate_info,
-                       style=None, single_eval_pos=single_eval_pos)
+            for batch_item in range(self.batch_size):
+                # Select a group for this sequence
+                if group_idx >= len(all_groups):
+                    group_idx = 0
+                
+                num_nodes, orig_group_idx, group = all_groups[group_idx]
+                group_idx += 1
+                
+                # Find the base instance (target)
+                base_instance = None
+                for inst in group:
+                    if isinstance(inst, dict) and inst.get('is_base', False):
+                        base_instance = inst
+                        break
+                
+                if base_instance is None:
+                    if len(group) > 0:
+                        base_instance = max(group, key=lambda x: len(x['coords']) if isinstance(x, dict) and 'coords' in x else 0)
+                    else:
+                        print(f"Warning: Empty group found for {num_nodes}, group {orig_group_idx}")
+                        continue
+                
+                # Get all non-base instances for context
+                other_instances = [inst for inst in group if inst is not base_instance]
+                
+                # Create sequence: test_size-1 context instances + 1 target instance
+                sequence = []
+                
+                # Add context instances (test_size-1)
+                context_count = self.seq_len_maximum - 1  # test_size - 1
+                if len(other_instances) >= context_count:
+                    # Randomly sample context_count instances from other_instances
+                    context_instances = random.sample(other_instances, context_count)
+                    sequence.extend(context_instances)
+                else:
+                    # If not enough other instances, use all available and repeat some
+                    sequence.extend(other_instances)
+                    while len(sequence) < context_count:
+                        # Fill remaining with random repetitions
+                        if len(other_instances) > 0:
+                            sequence.append(random.choice(other_instances))
+                        else:
+                            # If no other instances, use base_instance as context too
+                            sequence.append(base_instance)
+                
+                # Add target instance (base_instance) at the end
+                sequence.append(base_instance)
+                
+                # Ensure sequence has exactly seq_len_maximum instances
+                sequence = sequence[:self.seq_len_maximum]
+                
+                batch_sequences.append(sequence)
+            
+            # Convert batch to tensors
+            batch = self._create_batch_from_sequences(batch_sequences)
+            if batch is not None:
+                yield batch
+
+    def _create_batch_from_sequences(self, batch_sequences):
+        """Convert list of sequences to batch format"""
+        if not batch_sequences:
+            return None
+        
+        seq_len = len(batch_sequences[0])  # Should be seq_len_maximum
+        batch_size = len(batch_sequences)
+        
+        # Find maximum number of nodes across all instances
+        max_nodes = 0
+        for sequence in batch_sequences:
+            for instance in sequence:
+                if isinstance(instance, dict) and 'coords' in instance:
+                    max_nodes = max(max_nodes, len(instance['coords']))
+        
+        if max_nodes == 0:
+            print("Warning: No valid instances found in batch")
+            return None
+        
+        # Initialize tensors
+        x = torch.full((seq_len, batch_size, max_nodes, 2), -1.0, dtype=torch.float32)
+        y = torch.full((seq_len, batch_size, max_nodes), -1, dtype=torch.long)
+        
+        # Fill tensors
+        candidate_info_list = []
+        for batch_idx, sequence in enumerate(batch_sequences):
+            for seq_idx, instance in enumerate(sequence):
+                if isinstance(instance, dict):
+                    coords = instance.get('coords', [])
+                    tour = instance.get('tour', [])
+                    candidate_info = instance.get('candidate_info', {})
+                    
+                    num_nodes = len(coords)
+                    if num_nodes > 0:
+                        # Fill coordinates
+                        x[seq_idx, batch_idx, :num_nodes] = torch.tensor(coords, dtype=torch.float32)
+                        
+                        # Fill tour
+                        if len(tour) > 0:
+                            tour_tensor = torch.tensor(tour[:num_nodes], dtype=torch.long)
+                            y[seq_idx, batch_idx, :len(tour_tensor)] = tour_tensor
+                    
+                    candidate_info_list.append(candidate_info)
+        
+        # Set single_eval_pos to the last position (target position)
+        single_eval_pos = seq_len - 1
+        
+        # Create batch object
+        batch = Batch(
+            x=x,
+            y=y,
+            target_y=y,
+            candidate_info=candidate_info_list,
+            style=None,
+            single_eval_pos=single_eval_pos
+        )
+        
+        return batch
     
     def _create_batch_from_instances(self, instances: List[Dict], num_nodes: int):
         """Create batch tensors from instance list"""

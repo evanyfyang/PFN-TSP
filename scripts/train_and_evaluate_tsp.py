@@ -55,12 +55,26 @@ def parse_args():
                         help='Use unified encoding that combines graph and tour information')
     parser.add_argument('--use_shared_basis_film', action='store_true', default=False,
                         help='Use SharedBasisFiLM mode for merged large graph processing')
+    parser.add_argument('--use_instance_hypergraph', action='store_true', default=False,
+                        help='Use InstanceAwareHypergraphGNN mode (mathematical formulation with FiLM and hypergraph GCN)')
     parser.add_argument('--merge_duplicate_coords', action='store_true', default=True,
                         help='Merge nodes with identical coordinates when using SharedBasisFiLM mode')
     
     # Add loss direction control argument (bidirectional edges are always created)
     parser.add_argument('--loss_direction_mode', type=str, default='both', choices=['both', 'forward'],
                         help='How to handle edge directions in loss calculation (default: both). Note: bidirectional edges are always created for optimal GNN performance.')
+    
+    # Add edge type mode argument (for no-merge SharedBasisFiLM)
+    parser.add_argument('--edge_type_mode', type=str, default='triple', choices=['single', 'triple'],
+                        help='Edge type mode for no-merge SharedBasisFiLM: triple (3 edge types) or single (1 edge type with features)')
+    
+    # Add prediction mode argument
+    parser.add_argument('--prediction_mode', type=str, default='dot_product', choices=['dot_product', 'mlp_concat'],
+                        help='Prediction mode: dot_product (MLP([x_src, x_dst, w_emb, center]) * MLP(z_emb)) or mlp_concat (MLP([w_emb, x_emb, y_emb, z_emb]))')
+    
+    # Add residual norm control argument
+    parser.add_argument('--use_residual_norm', action='store_true', default=False,
+                        help='Use residual connections and LayerNorm in InstanceAwareHypergraphGNN (default: False)')
     
     # Add online/offline training mode arguments
     parser.add_argument('--training_mode', type=str, default='online', choices=['online', 'offline'],
@@ -114,8 +128,12 @@ def train_tsp_model(args):
         'single_eval_pos': args.test_size - 1,  # Always evaluate the last position
         'use_unified_encoding': args.use_unified_encoding,
         'use_shared_basis_film': args.use_shared_basis_film,
+        'use_instance_hypergraph': args.use_instance_hypergraph,
         'merge_duplicate_coords': args.merge_duplicate_coords,
-        'loss_direction_mode': args.loss_direction_mode  # Only loss direction control, bidirectional edges always created
+        'loss_direction_mode': args.loss_direction_mode,  # Only loss direction control, bidirectional edges always created
+        'prediction_mode': args.prediction_mode,  # Prediction mode control
+        'edge_type_mode': args.edge_type_mode,  # Edge type mode for no-merge SharedBasisFiLM
+        'use_residual_norm': args.use_residual_norm  # Residual connection and LayerNorm control
     }
     
     # Add mode-specific arguments
@@ -163,7 +181,7 @@ def train_tsp_model(args):
     
     return result.model.to(args.cuda_device), model_save_path
 
-def predict_tsp_with_pfn(model, coords, solution, candidate_info=None, use_complete_graph=False, device='cuda', decoding_strategy='greedy'):
+def predict_tsp_with_pfn(model, coords, solution, candidate_info=None, use_complete_graph=False, device='cuda', decoding_strategy='greedy', loss_direction_mode='both'):
     """Predict TSP tour using the trained PFN model"""
     model.eval()
     
@@ -278,7 +296,57 @@ def predict_tsp_with_pfn(model, coords, solution, candidate_info=None, use_compl
         # Build adjacency list
         adj_list = [[] for _ in range(num_nodes)]
         
-        # First pass: collect all edge probabilities
+        # Adjust edge processing based on loss_direction_mode
+        if loss_direction_mode == 'forward':
+            print(f"Using forward mode edge processing (single direction per edge)")
+            # For forward mode: each edge prediction represents a canonical direction
+            # We should use the predicted probability directly without averaging
+            edge_probs = {}  # (u, v) -> probability (single value, not list)
+            
+            for i in range(min(valid_edge_count, len(edge_values_np))):
+                # Check edge_index shape and access correctly
+                if edge_index_np.ndim == 2 and edge_index_np.shape[0] == 2:
+                    # edge_index is in 2xE format
+                    u, v = edge_index_np[0, i], edge_index_np[1, i]
+                elif edge_index_np.ndim == 2 and edge_index_np.shape[1] == 2:
+                    # edge_index is in Ex2 format
+                    u, v = edge_index_np[i, 0], edge_index_np[i, 1]
+                else:
+                    print(f"Warning: Unexpected edge_index shape: {edge_index_np.shape}")
+                    continue
+                
+                # Use node_map to map global node indices back to actual node indices
+                if u in node_map and v in node_map:
+                    u_info = node_map[u]  # (pos, batch, node)
+                    v_info = node_map[v]
+                    
+                    # Ensure nodes are from the last position
+                    if u_info[0] == seq_len-1 and v_info[0] == seq_len-1:
+                        u_node = u_info[2]
+                        v_node = v_info[2]
+                        
+                        # Check if nodes are within valid range
+                        if 0 <= u_node < num_nodes and 0 <= v_node < num_nodes:
+                            prob = edge_values_np[i]
+                            # Store probability for the specific direction predicted
+                            edge_probs[(u_node, v_node)] = prob
+                else:
+                    # Fallback: try to use indices directly if they're in valid range
+                    if 0 <= u < num_nodes and 0 <= v < num_nodes:
+                        prob = edge_values_np[i]
+                        edge_probs[(u, v)] = prob
+            
+            # Build adjacency list using single-direction probabilities
+            for (u_node, v_node), prob in edge_probs.items():
+                # In forward mode, we have the exact probability for this direction
+                adj_list[u_node].append((v_node, prob))
+                # For the reverse direction, we could use the same probability or a default
+                # Using same probability maintains symmetry in the adjacency list
+                adj_list[v_node].append((u_node, prob))
+        
+        else:  # loss_direction_mode == 'both'
+            print(f"Using both mode edge processing (average bidirectional probabilities)")
+            # Original logic for 'both' mode: collect all probabilities and average
         edge_probs = {}  # (u, v) -> list of probabilities
         
         for i in range(min(valid_edge_count, len(edge_values_np))):
@@ -322,7 +390,7 @@ def predict_tsp_with_pfn(model, coords, solution, candidate_info=None, use_compl
                         edge_probs[edge_key] = []
                     edge_probs[edge_key].append(prob)
         
-        # Second pass: build adjacency list with averaged probabilities
+            # Build adjacency list with averaged probabilities
         for (u_node, v_node), probs in edge_probs.items():
             # Calculate mean probability for both directions
             avg_prob = np.mean(probs)
@@ -591,7 +659,7 @@ def load_test_instances_from_dataset(test_dataset_path, test_instances=10, gener
                         target_instance = base_instance
                         
                         # Get all non-base instances as potential context
-                        remaining_instances = [inst for inst in group if inst != base_instance]
+                        remaining_instances = [inst for inst in group if inst is not base_instance]
                         if len(remaining_instances) > 0:
                             context_count = min(test_size-1, len(remaining_instances))
                             context_instances = random.sample(remaining_instances, context_count)
@@ -777,7 +845,7 @@ def load_test_instances_from_dataset(test_dataset_path, test_instances=10, gener
     print(f"Total loaded test sequences: {len(test_instances_gen)}")
     return test_instances_gen, lkh_solutions, candidate_infos
 
-def evaluate_and_compare(model, test_instances, lkh_solutions, candidate_infos, use_complete_graph=False, device='cuda', decoding_strategy='greedy', save_plot=True, plot_path='tsp_comparison.png'):
+def evaluate_and_compare(model, test_instances, lkh_solutions, candidate_infos, use_complete_graph=False, device='cuda', decoding_strategy='greedy', save_plot=True, plot_path='tsp_comparison.png', loss_direction_mode='both'):
     """
     Evaluate model and compare with OR-Tools.
     
@@ -798,11 +866,13 @@ def evaluate_and_compare(model, test_instances, lkh_solutions, candidate_infos, 
         decoding_strategy: Decoding strategy for TSP
         save_plot: Whether to save comparison plots
         plot_path: Path to save plots
+        loss_direction_mode: Direction mode for edge processing during prediction
         
     Returns:
         Dictionary containing evaluation results
     """
     print(f"Starting model evaluation with {decoding_strategy} decoding strategy...")
+    print(f"Using loss_direction_mode='{loss_direction_mode}' for edge processing")
     if use_complete_graph:
         print("Using complete graph for inference")
     else:
@@ -848,7 +918,8 @@ def evaluate_and_compare(model, test_instances, lkh_solutions, candidate_infos, 
             candidate_info=candidate_info_seq, 
             use_complete_graph=use_complete_graph,
             device=device, 
-            decoding_strategy=decoding_strategy
+            decoding_strategy=decoding_strategy,
+            loss_direction_mode=loss_direction_mode
         )
         pfn_time = time.time() - start_time
         pfn_distances.append(pfn_distance)
@@ -891,9 +962,10 @@ def evaluate_and_compare(model, test_instances, lkh_solutions, candidate_infos, 
         'ortools_times': processing_times_ortools
     }
 
-def load_tsp_model(model_path, emsize, nhid, nlayers, nhead, dropout, device='cuda', use_unified_encoding=False, use_shared_basis_film=False, merge_duplicate_coords=True, test_size=5):
+def load_tsp_model(model_path, emsize, nhid, nlayers, nhead, dropout, device='cuda', use_unified_encoding=False, use_shared_basis_film=False, use_instance_hypergraph=False, merge_duplicate_coords=True, test_size=5, loss_direction_mode='both'):
     """Load a pretrained TSP model"""
     print(f"Loading pretrained model from {model_path}...")
+    print(f"Using loss_direction_mode='{loss_direction_mode}' for testing")
     
     # For SharedBasisFiLM mode, we need to automatically detect num_instances from the checkpoint
     if use_shared_basis_film:
@@ -945,7 +1017,9 @@ def load_tsp_model(model_path, emsize, nhid, nlayers, nhead, dropout, device='cu
         gpu_device=device,
         use_unified_encoding=use_unified_encoding,
         use_shared_basis_film=use_shared_basis_film,
-        merge_duplicate_coords=merge_duplicate_coords
+        use_instance_hypergraph=use_instance_hypergraph,
+        merge_duplicate_coords=merge_duplicate_coords,
+        loss_direction_mode=loss_direction_mode
     )
     
     model = result.model
@@ -982,7 +1056,9 @@ def main():
             device=args.cuda_device,
             use_unified_encoding=args.use_unified_encoding,
             use_shared_basis_film=args.use_shared_basis_film,
-            test_size=args.test_size
+            use_instance_hypergraph=args.use_instance_hypergraph,
+            test_size=args.test_size,
+            loss_direction_mode=args.loss_direction_mode
         )
         model_path = args.model_path
     
@@ -1020,7 +1096,8 @@ def main():
         use_complete_graph=args.use_complete_graph,
         device=args.cuda_device, 
         decoding_strategy=args.decoding_strategy,
-        plot_path=plot_path
+        plot_path=plot_path,
+        loss_direction_mode=args.loss_direction_mode
     )
     
     results_path = os.path.join(args.save_dir, f"{model_name}_{args.generation_strategy}_{graph_type}.npz")

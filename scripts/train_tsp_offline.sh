@@ -1,13 +1,6 @@
 #!/bin/bash
 # Offline TSP training script - trains TSP models using pre-generated datasets
 # Always creates bidirectional edges for optimal GNN performance
-
-# 激活conda环境
-echo "激活conda环境PFN..."
-source ~/.bashrc
-conda activate PFN
-echo "当前环境: $CONDA_DEFAULT_ENV"
-
 mkdir -p saved_models
 
 # Default parameters
@@ -20,13 +13,17 @@ EPOCHS=20
 BATCH_SIZE=32
 EMSIZE=128
 NHID=128
-NLAYERS=3
+NLAYERS=6
 NHEAD=8
 GENERATION_STRATEGY="random_nodes_same_size"
 USE_UNIFIED_ENCODING=false
 USE_SHARED_BASIS_FILM=false
+USE_INSTANCE_HYPERGRAPH=false
 MERGE_DUPLICATE_COORDS=true
 LOSS_DIRECTION_MODE="both"  # Control loss calculation direction (bidirectional edges always created)
+EDGE_TYPE_MODE="triple"  # Edge type mode for no-merge SharedBasisFiLM: single or triple
+PREDICTION_MODE="mlp_concat"  # Prediction mode: 'dot_product' or 'mlp_concat'
+USE_RESIDUAL_NORM=false  # Use residual connections and LayerNorm
 
 # Show help information
 show_help() {
@@ -46,14 +43,22 @@ show_help() {
     echo "  --strategy STR        Generation strategy (random_nodes_same_size or fix_all_nodes_same_size)"
     echo "  --unified             Use unified encoding (combines graph and tour information)"
     echo "  --shared_film         Use SharedBasisFiLM mode (merged large graph processing)"
+    echo "  --instance_hypergraph Use InstanceAwareHypergraphGNN mode (mathematical formulation with FiLM and hypergraph GCN)"
     echo "  --no_merge_coords     Disable merging of duplicate coordinates (only for SharedBasisFiLM mode)"
     echo "  --loss_mode STR       Loss direction mode: 'both' (default) or 'forward'"
     echo "                        Note: Bidirectional edges are always created for optimal GNN performance"
+  echo "  --edge_type_mode STR  Edge type mode for no-merge SharedBasisFiLM: 'triple' (default) or 'single'"
+  echo "                        triple: 3 edge types (graph/tour/center), single: 1 edge type with features"
+  echo "  --prediction_mode STR Prediction mode: 'dot_product' (default) or 'mlp_concat'"
+  echo "                        dot_product: MLP([x_src, x_dst, w_emb, center]) * MLP(z_emb), mlp_concat: MLP([w_emb, x_emb, y_emb, z_emb])"
+  echo "                        Note: Enhanced with embedded distance and s_uvi features"
+  echo "  --use_residual_norm    Use residual connections and LayerNorm in InstanceAwareHypergraphGNN (default: false)"
     echo "  -h, --help            Show this help message"
     echo ""
     echo "Example:"
     echo "  $0 -d /path/to/dataset.pkl -s 30 -l 50 -e 10 --strategy fix_all_nodes_same_size"
     echo "  $0 -d /path/to/dataset.pkl --shared_film --no_merge_coords --loss_mode forward"
+  echo "  $0 -d /path/to/dataset.pkl --shared_film --no_merge_coords --edge_type_mode single"
 }
 
 # Parse command line arguments
@@ -115,6 +120,10 @@ while [[ $# -gt 0 ]]; do
             USE_SHARED_BASIS_FILM=true
             shift
             ;;
+        --instance_hypergraph)
+            USE_INSTANCE_HYPERGRAPH=true
+            shift
+            ;;
         --no_merge_coords)
             MERGE_DUPLICATE_COORDS=false
             shift
@@ -122,6 +131,18 @@ while [[ $# -gt 0 ]]; do
         --loss_mode)
             LOSS_DIRECTION_MODE="$2"
             shift 2
+            ;;
+        --edge_type_mode)
+            EDGE_TYPE_MODE="$2"
+            shift 2
+            ;;
+        --prediction_mode)
+            PREDICTION_MODE="$2"
+            shift 2
+            ;;
+        --use_residual_norm)
+            USE_RESIDUAL_NORM=true
+            shift
             ;;
         -h|--help)
             show_help
@@ -163,9 +184,35 @@ if [ "$LOSS_DIRECTION_MODE" != "both" ] && [ "$LOSS_DIRECTION_MODE" != "forward"
     exit 1
 fi
 
-# Validate encoding options (cannot use both unified and shared_film)
-if [ "$USE_UNIFIED_ENCODING" = true ] && [ "$USE_SHARED_BASIS_FILM" = true ]; then
-    echo "Error: Cannot use both --unified and --shared_film options simultaneously!" >&2
+# Validate edge type mode
+if [ "$EDGE_TYPE_MODE" != "single" ] && [ "$EDGE_TYPE_MODE" != "triple" ]; then
+    echo "Error: Invalid edge type mode: $EDGE_TYPE_MODE" >&2
+    echo "Must be one of: 'single', 'triple'" >&2
+    exit 1
+fi
+
+# Validate prediction mode
+if [ "$PREDICTION_MODE" != "dot_product" ] && [ "$PREDICTION_MODE" != "mlp_concat" ]; then
+    echo "Error: Invalid prediction mode: $PREDICTION_MODE" >&2
+    echo "Must be one of: 'dot_product', 'mlp_concat'" >&2
+    exit 1
+fi
+
+# Validate encoding options (cannot use multiple encoding modes simultaneously)
+encoding_modes_count=0
+if [ "$USE_UNIFIED_ENCODING" = true ]; then
+    encoding_modes_count=$((encoding_modes_count + 1))
+fi
+if [ "$USE_SHARED_BASIS_FILM" = true ]; then
+    encoding_modes_count=$((encoding_modes_count + 1))
+fi
+if [ "$USE_INSTANCE_HYPERGRAPH" = true ]; then
+    encoding_modes_count=$((encoding_modes_count + 1))
+fi
+
+if [ $encoding_modes_count -gt 1 ]; then
+    echo "Error: Cannot use multiple encoding modes simultaneously!" >&2
+    echo "Choose only one of: --unified, --shared_film, or --instance_hypergraph" >&2
     exit 1
 fi
 
@@ -180,8 +227,12 @@ echo "Model config: emsize=$EMSIZE, nhid=$NHID, nlayers=$NLAYERS, nhead=$NHEAD"
 echo "Generation strategy: $GENERATION_STRATEGY"
 echo "Unified encoding: $USE_UNIFIED_ENCODING"
 echo "SharedBasisFiLM mode: $USE_SHARED_BASIS_FILM"
+echo "InstanceAwareHypergraph mode: $USE_INSTANCE_HYPERGRAPH"
 echo "Merge duplicate coords: $MERGE_DUPLICATE_COORDS"
 echo "Loss direction mode: $LOSS_DIRECTION_MODE (bidirectional edges always created)"
+echo "Edge type mode: $EDGE_TYPE_MODE"
+echo "Prediction mode: $PREDICTION_MODE"
+echo "Use residual norm: $USE_RESIDUAL_NORM"
 echo "Training mode: OFFLINE (using pre-generated data)"
 echo ""
 
@@ -192,7 +243,6 @@ export TORCH_CUDNN_ALLOW_TF32=1
 export OMP_NUM_THREADS=4
 export TORCH_COMPILE_MODE=reduce-overhead
 
-# Build command with encoding and loss direction flags
 TRAIN_CMD="python scripts/train_and_evaluate_tsp.py \
     --training_mode offline \
     --dataset_path \"$DATASET_PATH\" \
@@ -209,9 +259,10 @@ TRAIN_CMD="python scripts/train_and_evaluate_tsp.py \
     --test_size 10 \
     --generation_strategy $GENERATION_STRATEGY \
     --loss_direction_mode $LOSS_DIRECTION_MODE \
+    --edge_type_mode $EDGE_TYPE_MODE \
+    --prediction_mode $PREDICTION_MODE \
     --train"
 
-# Add encoding options
 if [ "$USE_UNIFIED_ENCODING" = true ]; then
     TRAIN_CMD="$TRAIN_CMD --use_unified_encoding"
 fi
@@ -222,6 +273,15 @@ if [ "$USE_SHARED_BASIS_FILM" = true ]; then
     if [ "$MERGE_DUPLICATE_COORDS" = true ]; then
         TRAIN_CMD="$TRAIN_CMD --merge_duplicate_coords"
     fi
+fi
+
+if [ "$USE_INSTANCE_HYPERGRAPH" = true ]; then
+    TRAIN_CMD="$TRAIN_CMD --use_instance_hypergraph"
+fi
+
+# Add residual norm option
+if [ "$USE_RESIDUAL_NORM" = true ]; then
+    TRAIN_CMD="$TRAIN_CMD --use_residual_norm"
 fi
 
 eval $TRAIN_CMD
