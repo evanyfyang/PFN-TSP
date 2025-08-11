@@ -17,7 +17,7 @@ import random
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from pfns.train_tsp import train_tsp
-from pfns.priors.tsp_data_loader import TSPDataLoader, solve_tsp_ortools
+from pfns.priors.tsp_data_loader import TSPDataLoader, solve_tsp_ortools, solve_tsp_lkh3
 from pfns.priors.tsp_offline_data_loader import TSPOfflineDataLoader
 from pfns.priors.prior import Batch
 from pfns.priors.tsp_decoding_strategies import *
@@ -37,7 +37,7 @@ def parse_args():
     parser.add_argument('--lr', type=float, default=1e-3, help='Learning rate')
     parser.add_argument('--min_nodes', type=int, default=10, help='Minimum number of nodes in TSP')
     parser.add_argument('--max_nodes', type=int, default=20, help='Maximum number of nodes in TSP')
-    parser.add_argument('--max_candidates', type=int, default=5, help='Maximum number of candidates per node for LKH3')
+    parser.add_argument('--max_candidates', type=int, default=5, help='Maximum number of candidates per node for graph construction (LKH3 uses fixed 5)')
     parser.add_argument('--test_size', type=int, default=10, help='Number of seq len')
     parser.add_argument('--save_dir', type=str, default='./saved_models', help='Directory to save models')
     parser.add_argument('--cuda_device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu', help='Device')
@@ -845,7 +845,7 @@ def load_test_instances_from_dataset(test_dataset_path, test_instances=10, gener
     print(f"Total loaded test sequences: {len(test_instances_gen)}")
     return test_instances_gen, lkh_solutions, candidate_infos
 
-def evaluate_and_compare(model, test_instances, lkh_solutions, candidate_infos, use_complete_graph=False, device='cuda', decoding_strategy='greedy', save_plot=True, plot_path='tsp_comparison.png', loss_direction_mode='both'):
+def evaluate_and_compare(model, test_instances, lkh_solutions, candidate_infos, use_complete_graph=False, device='cuda', decoding_strategy='greedy', save_plot=True, plot_path='tsp_comparison.png', loss_direction_mode='both', max_candidates=5):
     """
     Evaluate model and compare with OR-Tools.
     
@@ -880,8 +880,10 @@ def evaluate_and_compare(model, test_instances, lkh_solutions, candidate_infos, 
     
     pfn_distances = []
     ortools_distances = []
+    lkh3_distances = []
     processing_times_pfn = []
     processing_times_ortools = []
+    processing_times_lkh3 = []
     
     viz_idx = np.random.randint(0, len(test_instances))
     
@@ -909,7 +911,21 @@ def evaluate_and_compare(model, test_instances, lkh_solutions, candidate_infos, 
         ortools_distance = calculate_tour_length(last_coords, ortools_tour)
         ortools_distances.append(ortools_distance)
         processing_times_ortools.append(ortools_solve_time)
-        
+
+        # Step 1.5: Compute LKH3 solution and record time
+        print(f"  Computing LKH3 solution for instance with {len(last_coords)} nodes...")
+        start_time = time.time()
+        try:
+            lkh3_tour, _ = solve_tsp_lkh3(last_coords, max_candidates=max_candidates)
+            lkh3_time = time.time() - start_time
+        except Exception as e:
+            print(f"  Warning: LKH3 failed, falling back to identity tour. Error: {e}")
+            lkh3_tour = list(range(len(last_coords)))
+            lkh3_time = time.time() - start_time
+        lkh3_distance = calculate_tour_length(last_coords, lkh3_tour)
+        lkh3_distances.append(lkh3_distance)
+        processing_times_lkh3.append(lkh3_time)
+
         # Step 2: Use model to predict solution and record time
         print(f"  Computing PFN solution...")
         start_time = time.time()
@@ -926,8 +942,8 @@ def evaluate_and_compare(model, test_instances, lkh_solutions, candidate_infos, 
         processing_times_pfn.append(pfn_time)
         
         # Step 3: Report comparison results
-        print(f"  Results: PFN distance={pfn_distance:.4f}, OR-Tools distance={ortools_distance:.4f}")
-        print(f"  Times: PFN={pfn_time:.4f}s, OR-Tools={ortools_solve_time:.4f}s")
+        print(f"  Results: PFN distance={pfn_distance:.4f}, OR-Tools distance={ortools_distance:.4f}, LKH3 distance={lkh3_distance:.4f}")
+        print(f"  Times: PFN={pfn_time:.4f}s, OR-Tools={ortools_solve_time:.4f}s, LKH3={lkh3_time:.4f}s")
         
         # Save visualization for one random instance
         if i == viz_idx and save_plot:
@@ -942,24 +958,28 @@ def evaluate_and_compare(model, test_instances, lkh_solutions, candidate_infos, 
     # Compute final statistics
     pfn_distances = np.array(pfn_distances)
     ortools_distances = np.array(ortools_distances)
-    relative_gap = (pfn_distances - ortools_distances) / ortools_distances * 100
+    relative_gap_vs_ortools = (pfn_distances - ortools_distances) / ortools_distances * 100
+    relative_gap_vs_lkh3 = (pfn_distances - lkh3_distances) / lkh3_distances * 100
+    ortools_vs_lkh3_gap = (ortools_distances - lkh3_distances) / lkh3_distances * 100
     
     print("\n===== Evaluation Results =====")
-    print(f"Average path length: PFN={np.mean(pfn_distances):.4f}, OR-Tools={np.mean(ortools_distances):.4f}")
-    print(f"Average relative gap: {np.mean(relative_gap):.2f}%")
-    print(f"Maximum relative gap: {np.max(relative_gap):.2f}%")
-    print(f"Minimum relative gap: {np.min(relative_gap):.2f}%")
-    print(f"PFN win rate: {np.mean(pfn_distances <= ortools_distances) * 100:.2f}%")
-    print(f"PFN average processing time: {np.mean(processing_times_pfn):.4f} seconds")
-    print(f"OR-Tools average processing time: {np.mean(processing_times_ortools):.4f} seconds")
-    print(f"Speed ratio (OR-Tools/PFN): {np.mean(processing_times_ortools)/np.mean(processing_times_pfn):.2f}x")
+    print(f"Average path length: PFN={np.mean(pfn_distances):.4f}, OR-Tools={np.mean(ortools_distances):.4f}, LKH3={np.mean(lkh3_distances):.4f}")
+    print(f"PFN vs OR-Tools avg gap: {np.mean(relative_gap_vs_ortools):.2f}%, PFN vs LKH3 avg gap: {np.mean(relative_gap_vs_lkh3):.2f}%")
+    print(f"OR-Tools vs LKH3 avg gap: {np.mean(ortools_vs_lkh3_gap):.2f}%")
+    print(f"PFN win rate vs OR-Tools: {np.mean(pfn_distances <= ortools_distances) * 100:.2f}% | vs LKH3: {np.mean(pfn_distances <= lkh3_distances) * 100:.2f}%")
+    print(f"Avg time (s): PFN={np.mean(processing_times_pfn):.4f}, OR-Tools={np.mean(processing_times_ortools):.4f}, LKH3={np.mean(processing_times_lkh3):.4f}")
+    print(f"Speed ratios: OR-Tools/PFN={np.mean(processing_times_ortools)/np.mean(processing_times_pfn):.2f}x, LKH3/PFN={np.mean(processing_times_lkh3)/np.mean(processing_times_pfn):.2f}x")
     
     return {
         'pfn_distances': pfn_distances,
         'ortools_distances': ortools_distances,
-        'relative_gap': relative_gap,
+        'lkh3_distances': lkh3_distances,
+        'relative_gap_vs_ortools': relative_gap_vs_ortools,
+        'relative_gap_vs_lkh3': relative_gap_vs_lkh3,
+        'ortools_vs_lkh3_gap': ortools_vs_lkh3_gap,
         'pfn_times': processing_times_pfn,
-        'ortools_times': processing_times_ortools
+        'ortools_times': processing_times_ortools,
+        'lkh3_times': processing_times_lkh3
     }
 
 def load_tsp_model(model_path, emsize, nhid, nlayers, nhead, dropout, device='cuda', use_unified_encoding=False, use_shared_basis_film=False, use_instance_hypergraph=False, merge_duplicate_coords=True, test_size=5, loss_direction_mode='both'):
@@ -1097,16 +1117,21 @@ def main():
         device=args.cuda_device, 
         decoding_strategy=args.decoding_strategy,
         plot_path=plot_path,
-        loss_direction_mode=args.loss_direction_mode
+        loss_direction_mode=args.loss_direction_mode,
+        max_candidates=args.max_candidates
     )
     
     results_path = os.path.join(args.save_dir, f"{model_name}_{args.generation_strategy}_{graph_type}.npz")
     np.savez(results_path, 
              pfn_distances=results['pfn_distances'],
              ortools_distances=results['ortools_distances'],
-             relative_gap=results['relative_gap'],
+             lkh3_distances=results['lkh3_distances'],
+             relative_gap_vs_ortools=results['relative_gap_vs_ortools'],
+             relative_gap_vs_lkh3=results['relative_gap_vs_lkh3'],
+             ortools_vs_lkh3_gap=results['ortools_vs_lkh3_gap'],
              pfn_times=results['pfn_times'],
-             ortools_times=results['ortools_times'])
+             ortools_times=results['ortools_times'],
+             lkh3_times=results['lkh3_times'])
     
     print(f"Results saved to {results_path}")
     

@@ -24,6 +24,7 @@ from .utils import init_dist, bool_mask_to_att_mask
 from .priors.tsp_data_loader import TSPDataLoader
 from .priors.tsp_encoder import tsp_graph_encoder_generator, tsp_tour_encoder_generator
 from torch.autograd import profiler
+import psutil
 
 class TSPAttentionCriterion(nn.Module):
     """
@@ -160,7 +161,6 @@ class TSPAttentionCriterion(nn.Module):
             edge_info_mappings = {
                 'edge_to_instances': self._current_edge_info.get('edge_to_instances', {}),
                 'instance_to_edges': self._current_edge_info.get('instance_to_edges', {}),
-                'instance_mapping': self._current_edge_info.get('instance_mapping', {}),
                 'coordinate_merging_enabled': self._current_edge_info.get('coordinate_merging_enabled', False)
             }
         
@@ -241,6 +241,20 @@ class TSPAttentionCriterion(nn.Module):
                             label_subset = edge_labels[:min_size]
                             weight_subset = edge_weights[:min_size]
                             
+                            # Debug: per-step pos/neg counts
+                            try:
+                                import os
+                                if os.environ.get('TSP_DEBUG_GUARDS', '0') == '1':
+                                    with torch.no_grad():
+                                        valid_mask = weight_subset > 0
+                                        pos_count = int(((label_subset == 1.0) & valid_mask).sum().item())
+                                        neg_count = int(((label_subset == 0.0) & valid_mask).sum().item())
+                                        total_pred = int(valid_mask.sum().item())
+                                        expected_pos = 2 * int(num_valid_nodes)
+                                        print(f"DEBUG(loss): pos={pos_count} neg={neg_count} total={total_pred} expected_pos~={expected_pos}")
+                            except Exception:
+                                pass
+
                             bce_loss = F.binary_cross_entropy_with_logits(
                                 pred_subset, label_subset, weight=weight_subset, reduction='sum'
                             )
@@ -373,53 +387,35 @@ class TSPAttentionCriterion(nn.Module):
                 
                 if global_u is not None and global_v is not None:
                     tour_edges_global.add((global_u, global_v))
-            
-            if len(tour_edges_global) > 10:
-
-                unique_tour_edges = set()
-                for u, v in tour_edges_global:
-                    canonical_edge = (min(u, v), max(u, v))
-                    unique_tour_edges.add(canonical_edge)
-                
-                if len(unique_tour_edges) > 5:
-                    tour_edges_global = set()
-                    for local_idx, global_idx in enumerate(city_node_indices):
-                        if local_idx < len(valid_indices):
-                            orig_node = valid_indices[local_idx].item()
-                            for orig_u, orig_v in tour_edges_set:
-                                if orig_u == orig_node:
-                                    for local_idx2, global_idx2 in enumerate(city_node_indices):
-                                        if local_idx2 < len(valid_indices) and valid_indices[local_idx2].item() == orig_v:
-                                            tour_edges_global.add((global_idx, global_idx2))
-                                            break
-        else:
-            orig_to_global = {}
-            for local_idx, global_idx in enumerate(city_node_indices):
-                if local_idx < len(valid_indices):
-                    orig_node = valid_indices[local_idx].item()
-                    orig_to_global[orig_node] = global_idx
-            
-            tour_edges_global = set()
-            for u_orig, v_orig in tour_edges_set:
-                if u_orig in orig_to_global and v_orig in orig_to_global:
-                    u_global = orig_to_global[u_orig]
-                    v_global = orig_to_global[v_orig]
-                    tour_edges_global.add((u_global, v_global))
         
-        # 检查每条边是否为tour边
         tour_edges_found = 0
         
         for edge_idx in range(min(num_edges, edge_index.size(1))):
             u_global = edge_index[0, edge_idx].item()
             v_global = edge_index[1, edge_idx].item()
             
-            if (u_global, v_global) in tour_edges_global:
+            is_tour_edge = False
+            if self.loss_direction_mode == 'both':
+                is_tour_edge = ((u_global, v_global) in tour_edges_global or 
+                               (v_global, u_global) in tour_edges_global)
+            else:
+                is_tour_edge = (u_global, v_global) in tour_edges_global
+            
+            if is_tour_edge:
                 edge_labels[edge_idx] = 1.0
-                edge_weights[edge_idx] = 1.0
+                # In 'forward' mode, only keep canonical direction (u < v). Set weight=0 for reverse.
+                if self.loss_direction_mode == 'forward' and u_global > v_global:
+                    edge_weights[edge_idx] = 0.0
+                else:
+                    edge_weights[edge_idx] = 1.0
                 tour_edges_found += 1
             else:
                 edge_labels[edge_idx] = 0.0
-                edge_weights[edge_idx] = 0.1
+                if self.loss_direction_mode == 'forward' and u_global > v_global:
+                    # Reverse direction for non-tour edges is ignored
+                    edge_weights[edge_idx] = 0.0
+                else:
+                    edge_weights[edge_idx] = 0.1
         
         return edge_labels, edge_weights
 
@@ -450,15 +446,24 @@ class TSPAttentionCriterion(nn.Module):
                 u_local = global_to_local[u_global]
                 v_local = global_to_local[v_global]
                 
+                # Check if this edge is in tour_edges_set
                 if (u_local, v_local) in tour_edges_set:
                     edge_labels[i] = 1.0
                     edge_weights[i] = 1.0
                 else:
                     edge_labels[i] = 0.0
-                    edge_weights[i] = 0.1
+                    # For forward mode, set weight to 0 for reverse edges (u > v)
+                    if self.loss_direction_mode == 'forward' and u_global > v_global:
+                        edge_weights[i] = 0.0  # Ignore reverse edges in loss calculation
+                    else:
+                        edge_weights[i] = 0.1
             else:
                 edge_labels[i] = 0.0
-                edge_weights[i] = 0.1
+                # For forward mode, set weight to 0 for reverse edges (u > v)
+                if self.loss_direction_mode == 'forward' and u_global > v_global:
+                    edge_weights[i] = 0.0  # Ignore reverse edges in loss calculation
+                else:
+                    edge_weights[i] = 0.1
         
         return edge_labels, edge_weights
 
@@ -506,7 +511,11 @@ class TSPAttentionCriterion(nn.Module):
                 edge_weights[i] = 1.0
             else:
                 edge_labels[i] = 0.0
-                edge_weights[i] = 0.1
+                # For forward mode, set weight to 0 for reverse edges (u > v)
+                if self.loss_direction_mode == 'forward' and u_idx > v_idx:
+                    edge_weights[i] = 0.0  # Ignore reverse edges in loss calculation
+                else:
+                    edge_weights[i] = 0.1
         
         return edge_labels, edge_weights
 
@@ -638,6 +647,16 @@ def train(priordataloader_class_or_get_batch: prior.PriorDataLoader | callable, 
         tqdm_iter = tqdm(range(len(dl)), desc='Training Epoch') if progress_bar else None
 
         for batch, full_data in enumerate(dl):
+            # 每10个step监控一次内存
+            if batch % 10 == 0:
+                try:
+                    gpu_allocated = torch.cuda.memory_allocated() / 1024**3
+                    gpu_reserved = torch.cuda.memory_reserved() / 1024**3
+                    cpu_memory = psutil.Process().memory_info().rss / 1024**3
+                    print(f"Step {batch}: GPU: {gpu_allocated:.3f}GB allocated, {gpu_reserved:.3f}GB reserved | CPU: {cpu_memory:.3f}GB")
+                except Exception as e:
+                    print(f"Memory monitoring error at step {batch}: {e}")
+            
             data = (full_data.style.to(device) if full_data.style is not None else None, full_data.x.to(device), full_data.y.to(device))
             targets = full_data.target_y.to(device)
             single_eval_pos = full_data.single_eval_pos
@@ -738,7 +757,8 @@ def train(priordataloader_class_or_get_batch: prior.PriorDataLoader | callable, 
             #     raise(e)
 
             if tqdm_iter:
-                tqdm_iter.set_postfix({'data_time': time_to_get_batch, 'step_time': step_time, 'mean_loss': total_loss / (batch+1)})
+                curr_loss = float(loss.detach().cpu()) if torch.is_tensor(loss) else float(loss)
+                tqdm_iter.set_postfix({'data_time': time_to_get_batch, 'step_time': step_time, 'loss': curr_loss})
 
             before_get_batch = time.time()
         return get_metrics()
@@ -886,7 +906,7 @@ def train_tsp(
     # Prepare extra_prior_kwargs_dict
     default_kwargs = {
         'num_nodes_range': num_nodes_range,
-        'max_candidates': max_candidates
+        'graph_max_candidates': max_candidates 
     }
     
     # Merge with any additional kwargs passed in
@@ -910,7 +930,7 @@ def train_tsp(
     num_instances = batch_size * seq_len
     encoder_generator = lambda num_features, emsize, **kwargs: tsp_graph_encoder_generator(
         num_features, emsize, 
-        max_candidates=max_candidates, 
+        max_candidates=max_candidates,  # This is graph_max_candidates for TSPGraphEncoder
         use_unified_encoding=use_unified_encoding,
         use_shared_basis_film=use_shared_basis_film,
         use_instance_hypergraph=use_instance_hypergraph,

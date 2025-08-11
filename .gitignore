@@ -167,6 +167,7 @@ torch_sampling/
 models_diff/
 *.out
 *.pkl
+*.png
 pfns/priors/LKH
 pfns/priors/lkh3_temp
 /edge_prediction_results

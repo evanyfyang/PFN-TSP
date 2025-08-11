@@ -4,6 +4,7 @@ import torch.nn as nn
 import torch_geometric.nn as gnn
 from torch_geometric.nn import global_mean_pool, global_add_pool, global_max_pool, BatchNorm
 import torch.nn.functional as F
+from torch_geometric.utils import softmax
 
 from torch_scatter import scatter_mean, scatter_add
 
@@ -124,7 +125,7 @@ class InstanceAwareHypergraphGNN(nn.Module):
     - Hypergraph GCN for instance information exchange
     - Solution edge prediction
     """
-    def __init__(self, depth, feats, units, act_fn, agg_fn, num_instances, num_heads=8, message_agg='mean', prediction_mode='dot_product', use_residual_norm=False):
+    def __init__(self, depth, feats, units, act_fn, agg_fn, num_instances, num_heads=8, message_agg='mean', prediction_mode='dot_product', use_residual_norm=False, aggregation_mode: str = 'edge_first', share_film_across_layers: bool = True):
         super().__init__()
         self.depth = depth
         self.units = units
@@ -134,12 +135,15 @@ class InstanceAwareHypergraphGNN(nn.Module):
         self.message_agg = message_agg  # 'mean', 'sum', 'max', etc.
         self.prediction_mode = prediction_mode  # 'dot_product' or 'mlp_concat'
         self.use_residual_norm = use_residual_norm  # Control residual connections and LayerNorm
+        self.aggregation_mode = aggregation_mode  # 'edge_first' (default) or 'instance_first'
+        self.share_film_across_layers = share_film_across_layers
 
         self.v_lin0 = nn.Linear(feats, units)  # W_v for nodes
         self.e_lin0 = nn.Linear(2, units)      # W_e for edges [distance, is_center]
         
         self.dist_embedder = nn.Linear(1, units)  # Distance to embedding (same as w_emb)
         self.s_uvi_embedder = nn.Linear(1, units)  # s_uvi (0/1) to embedding (same as w_emb)
+        self.ctx_uvi_embedder = nn.Linear(1, units)  # context/target indicator (0=target,1=context)
         self.target_embedder = nn.Linear(1, units)  # target/context embedding (0=context, 1=target)
 
         self.message_mlps = nn.ModuleList([
@@ -153,12 +157,54 @@ class InstanceAwareHypergraphGNN(nn.Module):
                 nn.Linear(units // 2, units)
             ) for _ in range(depth)
         ])
+        # Attention scorer for GAT-style pooling over (edge, instance) pairs
+        self.att_mlps = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(units + units, units // 2),
+                act_fn,
+                nn.Linear(units // 2, 1)
+            ) for _ in range(depth)
+        ])
+        # Intra-instance attention scorer (per (inst, dst) group)
+        self.intra_att_mlps = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(units + units, units // 2),
+                act_fn,
+                nn.Linear(units // 2, 1)
+            ) for _ in range(depth)
+        ])
         
         self.shared_film_mlp = nn.Sequential(
             nn.Linear(units, units),  # [z_i + dist_emb + s_uvi_emb]
             act_fn,
             nn.Linear(units, 2 * units)   # output [gamma, beta]
         )
+
+        # Instance-shared FiLM (per instance, shared for all nodes/edges in that instance)
+        # Inputs: [z_i, ctx_i]
+        film_input_dim = units + 1
+        def make_film_block():
+            return nn.Sequential(
+                nn.Linear(film_input_dim, units),
+                act_fn,
+                nn.Linear(units, 2 * units)
+            )
+        if share_film_across_layers:
+            self.instance_node_film = make_film_block()
+            self.instance_edge_film = make_film_block()
+        else:
+            self.instance_node_film = nn.ModuleList([make_film_block() for _ in range(depth)])
+            self.instance_edge_film = nn.ModuleList([make_film_block() for _ in range(depth)])
+
+        # Edge-conditional FiLM delta (per (edge, instance) pair) to refine instance-shared FiLM
+        # Inputs concat: [z_i (units), w_e (units), dist_emb (units), s_uvi_emb (units), ctx_uvi_emb (units)] => 5*units
+        def make_edge_cond_film_block():
+            return nn.Sequential(
+                nn.Linear(5 * units, units),
+                act_fn,
+                nn.Linear(units, 2 * units)
+            )
+        self.edge_cond_film_mlps = nn.ModuleList([make_edge_cond_film_block() for _ in range(depth)])
         
         self.node_update_mlps = nn.ModuleList([
             nn.Linear(units, units) for _ in range(depth)
@@ -197,12 +243,23 @@ class InstanceAwareHypergraphGNN(nn.Module):
                 if isinstance(layer, nn.Linear):
                     nn.init.xavier_uniform_(layer.weight, gain=2.0)  # Larger gain for instance MLP
                     nn.init.zeros_(layer.bias)
+
+            # Learnable temperature for stabilized dot-product logits
+            self.dot_temperature = nn.Parameter(torch.tensor(5.0))
         else:  # mlp_concat
             self.edge_projection = nn.Linear(5 * units, units)  # Project 5*units to units first
             self.output_mlp = nn.Sequential(
                 nn.Linear(units, units // 2),  # Reduced size
                 act_fn,
                 nn.Linear(units // 2, 1)
+            )
+
+        # Per-instance EmbNet baseline components (reused when TSP_PER_INSTANCE_EMBNET=1)
+        self.per_inst_embnet = EmbNet(depth=self.depth, feats=2, units=self.units, act_fn=self.act_fn, agg_fn=self.agg_fn)
+        self.per_inst_head = nn.Sequential(
+            nn.Linear(self.units, self.units // 2),
+            act_fn,
+            nn.Linear(self.units // 2, 1)
             )
         
         if use_residual_norm:
@@ -218,7 +275,7 @@ class InstanceAwareHypergraphGNN(nn.Module):
         self.e_bns = nn.ModuleList([BatchNorm(units) for _ in range(depth)])
         self.inst_bns = nn.ModuleList([BatchNorm(units) for _ in range(depth)])
 
-    def forward(self, x, edge_index, edge_attr, instance_mapping, edge_to_instances=None, instance_to_edges=None, s_uvi_matrix=None, single_eval_pos=None):
+    def forward(self, x, edge_index, edge_attr, instance_mapping, edge_to_instances=None, instance_to_edges=None, s_uvi_matrix=None, ctx_uvi_matrix=None, ctx_i_vector=None, single_eval_pos=None):
         """
         Forward pass for one-to-many node/edge-instance mapping.
         """
@@ -227,23 +284,84 @@ class InstanceAwareHypergraphGNN(nn.Module):
         num_instances = s_uvi_matrix.size(1) if s_uvi_matrix is not None else len(instance_mapping)
         units = self.units
         
+        # Optional pure per-instance EmbNet prediction path (no internal hypergraph propagation)
+        import os
+        if os.environ.get('TSP_PER_INSTANCE_EMBNET', '0') == '1' and instance_to_edges is not None:
+            # Initialize edge predictions
+            edge_predictions = torch.zeros(num_edges, num_instances, device=x.device)
+            # For each instance, build subgraph and run EmbNet
+            for inst_id in range(num_instances):
+                edge_ids = instance_to_edges.get(inst_id, [])
+                if not edge_ids:
+                    continue
+                edge_ids_tensor = torch.tensor(edge_ids, dtype=torch.long, device=x.device)
+                # Gather nodes used in these edges
+                nodes_used = torch.unique(torch.cat([
+                    edge_index[0, edge_ids_tensor], edge_index[1, edge_ids_tensor]
+                ], dim=0))
+                if nodes_used.numel() < 2:
+                    continue
+                # Local reindex
+                node_id_map = torch.empty(num_nodes, dtype=torch.long, device=x.device).fill_(-1)
+                node_id_map[nodes_used] = torch.arange(nodes_used.size(0), device=x.device)
+                local_edges = node_id_map[edge_index[:, edge_ids_tensor]]  # [2, E_i]
+                # Subgraph node features and edge attrs
+                x_sub = x[nodes_used]  # [N_i, 2]
+                # Compute distances for subgraph edges
+                src_l = local_edges[1]
+                dst_l = local_edges[0]
+                dist_l = torch.norm(x_sub[src_l] - x_sub[dst_l], dim=1, keepdim=True)
+                is_center_l = torch.zeros_like(dist_l)
+                pad_zero = torch.zeros_like(dist_l)
+                edge_attr_sub = torch.cat([dist_l, is_center_l, pad_zero], dim=1)  # [E_i, 3]
+                # Run EmbNet to get edge embeddings
+                # Override aggregation to a stable index_add for this subgraph
+                def _subgraph_agg(messages, dst_idx, N=x_sub.size(0), U=self.units, dev=x.device):
+                    out = torch.zeros(N, U, device=dev)
+                    return out.index_add(0, dst_idx, messages)
+                self.per_inst_embnet.agg_fn = _subgraph_agg
+                w_sub = self.per_inst_embnet(x_sub, local_edges, edge_attr_sub)  # [E_i, units]
+                # Predict logits with a trainable head per edge
+                logits = self.per_inst_head(w_sub).squeeze(-1)  # [E_i]
+                edge_predictions[edge_ids_tensor, inst_id] = logits
+            # Return placeholders for embeddings
+            x_emb = self.act_fn(self.v_lin0(x))
+            w_emb = self.act_fn(self.e_lin0(edge_attr))
+            z_tensor_clean = torch.zeros(num_instances, units, device=x.device)
+            return x_emb, w_emb, z_tensor_clean, edge_predictions
+        
         x_emb = self.act_fn(self.v_lin0(x))  # [N, units]
         w_emb = self.act_fn(self.e_lin0(edge_attr))  # [E, units]
         
-        instance_tensor = torch.full((num_nodes,), -1, dtype=torch.long, device=x.device)
+        # Build many-to-one mapping from nodes to instances (exclude center nodes)
+        instance_tensor = torch.full((num_nodes,), -1, dtype=torch.long, device=x.device)  # kept for compatibility
+        inst_ids_list = []
+        node_ids_list = []
         for inst_id, node_indices in instance_mapping.items():
             if len(node_indices) > 0:
+                # mark for compatibility (optional, not used for z)
                 instance_tensor[node_indices] = inst_id
+                city_nodes = node_indices[:-1] if len(node_indices) > 1 else node_indices
+                for nid in city_nodes:
+                    inst_ids_list.append(inst_id)
+                    node_ids_list.append(nid)
+
+        if len(node_ids_list) > 0:
+            inst_ids_concat = torch.tensor(inst_ids_list, dtype=torch.long, device=x.device)
+            node_ids_concat = torch.tensor(node_ids_list, dtype=torch.long, device=x.device)
+        else:
+            inst_ids_concat = torch.empty(0, dtype=torch.long, device=x.device)
+            node_ids_concat = torch.empty(0, dtype=torch.long, device=x.device)
         
         z_tensor = torch.zeros(num_instances, units, device=x.device)
-        valid_mask = instance_tensor >= 0
-        if valid_mask.any():
+        if node_ids_concat.numel() > 0:
             z_tensor = scatter_mean(
-                x_emb[valid_mask], 
-                instance_tensor[valid_mask], 
+                x_emb[node_ids_concat],
+                inst_ids_concat,
                 dim=0, 
                 dim_size=num_instances
             )
+        valid_mask = node_ids_concat.numel() > 0
         
         if instance_mapping:
             max_inst_id = max(instance_mapping.keys()) if instance_mapping else 0
@@ -268,53 +386,182 @@ class InstanceAwareHypergraphGNN(nn.Module):
         z_tensor_clean = z_tensor.clone()  
         enhanced_z_tensor = z_tensor + target_emb  
         
-        for l in range(self.depth):
-            messages_all = torch.zeros(num_edges, units, device=x.device)
-            counts = torch.zeros(num_edges, device=x.device)
-            
-            if edge_to_instances is not None:
-                edge_inst_pairs = []
-                for e in range(num_edges):
-                    if e in edge_to_instances:
-                        for inst_id in edge_to_instances[e]:
+        # Precompute edge-instance pairing tensors once (static across layers)
+        if edge_to_instances is not None:
+            edge_inst_pairs = []
+            for e in range(num_edges):
+                inst_list = edge_to_instances.get(e, []) if isinstance(edge_to_instances, dict) else []
+                for inst_id in inst_list:
                             edge_inst_pairs.append((e, inst_id))
-                
-                if edge_inst_pairs:
-                    edge_ids, inst_ids = zip(*edge_inst_pairs)
-                    edge_ids = torch.tensor(edge_ids, device=x.device)
-                    inst_ids = torch.tensor(inst_ids, device=x.device)
-                    
-                    src = edge_index[1, edge_ids]
-                    dst = edge_index[0, edge_ids]
-                    
-                    msg = self.message_mlps[l](x_emb[src])
-                    w_e = w_emb[edge_ids]
-                    z_i = enhanced_z_tensor[inst_ids]  # Use enhanced instance embeddings
-                    
-                    s_uvi = s_uvi_matrix[edge_ids, inst_ids] if s_uvi_matrix is not None else torch.zeros(len(edge_ids), device=x.device)
-                    dist = edge_attr[edge_ids, 0]
-                    
-                    dist_emb = self.dist_embedder(dist.unsqueeze(1))  # [num_pairs, units]
-                    s_uvi_emb = self.s_uvi_embedder(s_uvi.unsqueeze(1))  # [num_pairs, units]
-                    
-                    gate_input = torch.cat([z_i, w_e + s_uvi_emb], dim=1)
-                    gate = torch.sigmoid(self.gate_mlps[l](gate_input))
-                    
-                    film_input = z_i + dist_emb + s_uvi_emb
+            if len(edge_inst_pairs) > 0:
+                edge_ids_all, inst_ids_all = zip(*edge_inst_pairs)
+                edge_ids_all = torch.tensor(edge_ids_all, device=x.device)
+                inst_ids_all = torch.tensor(inst_ids_all, device=x.device)
+            else:
+                edge_ids_all = torch.empty(0, dtype=torch.long, device=x.device)
+                inst_ids_all = torch.empty(0, dtype=torch.long, device=x.device)
+        else:
+            edge_ids_all = torch.empty(0, dtype=torch.long, device=x.device)
+            inst_ids_all = torch.empty(0, dtype=torch.long, device=x.device)
+
+        src_all = edge_index[1, edge_ids_all] if edge_ids_all.numel() > 0 else torch.empty(0, dtype=torch.long, device=x.device)
+        dst_all = edge_index[0, edge_ids_all] if edge_ids_all.numel() > 0 else torch.empty(0, dtype=torch.long, device=x.device)
+        dist_all = edge_attr[edge_ids_all, 0] if edge_ids_all.numel() > 0 else torch.empty(0, device=x.device)
+        s_uvi_all = s_uvi_matrix[edge_ids_all, inst_ids_all] if (edge_ids_all.numel() > 0 and s_uvi_matrix is not None) else torch.empty(0, device=x.device)
+        ctx_uvi_all = ctx_uvi_matrix[edge_ids_all, inst_ids_all] if (edge_ids_all.numel() > 0 and ctx_uvi_matrix is not None) else torch.empty(0, device=x.device)
+
+        for l in range(self.depth):
+            if torch.jit.is_scripting():
+                debug_enabled = False
+            else:
+                import os
+                debug_enabled = os.environ.get('TSP_DEBUG_GUARDS', '0') == '1'
+                enable_film = os.environ.get('TSP_ENABLE_FILM', '1') == '1'
+                step1_use_z = os.environ.get('TSP_STEP1_USE_Z', '1') == '1'
+
+            # Step 1: Intra-instance aggregation (gated mean over incoming edges per instance)
+            if self.aggregation_mode == 'instance_first':
+                messages_all = torch.zeros(num_edges, units, device=x.device)  # will be produced in Step2
+
+                # Step1a: per-(edge,inst) gated messages (no FiLM, no z_i dependence)
+                if edge_ids_all.numel() > 0:
+                    msg0 = self.message_mlps[l](x_emb[src_all])
+                    dist_emb0 = self.dist_embedder(dist_all.unsqueeze(1))
+                    s_emb0 = self.s_uvi_embedder(s_uvi_all.unsqueeze(1)) if s_uvi_all.numel() > 0 else torch.zeros_like(dist_emb0)
+                    ctxu_emb0 = self.ctx_uvi_embedder(ctx_uvi_all.unsqueeze(1)) if ctx_uvi_all.numel() > 0 else torch.zeros_like(dist_emb0)
+                    suvi_ctx0 = s_emb0 + ctxu_emb0
+                    w_e0 = w_emb[edge_ids_all]
+                    # Use z_i for gate weighting in Step1 (no FiLM)
+                    z_i0 = z_tensor[inst_ids_all] if step1_use_z else torch.zeros_like(z_tensor[inst_ids_all])
+                    gate_input0 = torch.cat([z_i0, w_e0 + suvi_ctx0], dim=1)
+                    gate0 = 1.0 + torch.tanh(self.gate_mlps[l](gate_input0))
+                    mod_msg0 = gate0 * msg0
+
+                    # Step1b: build per-instance node deltas with attention within (inst,dst) group
+                    key_node = inst_ids_all * num_nodes + dst_all
+                    # group by unique (inst,dst)
+                    unique_pair, pair_idx, pair_counts = torch.unique(
+                        key_node, return_inverse=True, return_counts=True
+                    )
+                    # Intra-instance attention logits using the same features as gate_input0
+                    att_logits0 = self.intra_att_mlps[l](gate_input0).squeeze(-1)  # [num_pairs]
+                    att_alpha0 = softmax(att_logits0, pair_idx, num_nodes=unique_pair.size(0))  # per (inst,dst)
+                    weighted_msg0 = att_alpha0.unsqueeze(1) * mod_msg0
+                    # aggregate to per (inst,dst)
+                    node_delta_pair = scatter_add(weighted_msg0, pair_idx, dim=0, dim_size=unique_pair.size(0))  # [num_unique_pairs, d]
+
+                    # Step1c: per-(edge,inst) edge deltas (before FiLM)
+                    edge_delta_ei = mod_msg0  # reuse mod_msg0 as edge-side delta base
+
+                else:
+                    node_delta_pair = torch.zeros(0, units, device=x.device)
+                    edge_delta_ei = torch.zeros(0, units, device=x.device)
+
+                # Step 2: per-instance shared FiLM over (z_i, ctx_i), then cross-instance aggregation
+                if ctx_i_vector is None:
+                    ctx_i_vec = torch.zeros(num_instances, device=x.device)
+                else:
+                    ctx_i_vec = ctx_i_vector
+                film_in = torch.cat([z_tensor, ctx_i_vec.unsqueeze(1)], dim=1)
+                if enable_film:
+                    if self.share_film_across_layers:
+                        node_film = self.instance_node_film(film_in)
+                        edge_film = self.instance_edge_film(film_in)
+                    else:
+                        node_film = self.instance_node_film[l](film_in)
+                        edge_film = self.instance_edge_film[l](film_in)
+                    raw_gamma_n, raw_beta_n = node_film.chunk(2, dim=1)  # [I,d]
+                    raw_gamma_e, raw_beta_e = edge_film.chunk(2, dim=1)  # [I,d]
+                    # Remove clamping: allow full modulation range
+                    gamma_n = 1.0 + raw_gamma_n
+                    beta_n = raw_beta_n
+                    gamma_e = 1.0 + raw_gamma_e
+                    beta_e = raw_beta_e
+                else:
+                    gamma_n = torch.ones(num_instances, units, device=x.device)
+                    beta_n = torch.zeros(num_instances, units, device=x.device)
+                    gamma_e = torch.ones(num_instances, units, device=x.device)
+                    beta_e = torch.zeros(num_instances, units, device=x.device)
+
+                # Compressed aggregation without allocating I*N buffers:
+                if edge_ids_all.numel() > 0:
+                    # Apply per-instance node FiLM to each (inst,node) aggregated delta
+                    inst_for_pair = unique_pair // num_nodes
+                    node_for_pair = unique_pair % num_nodes
+                    gn_pair = gamma_n[inst_for_pair]
+                    bn_pair = beta_n[inst_for_pair]
+                    node_delta_pair_f = gn_pair * node_delta_pair + bn_pair  # [num_unique_pairs, d]
+                    # Aggregate across instances to each global node with mean
+                    sum_per_node = scatter_add(node_delta_pair_f, node_for_pair, dim=0, dim_size=num_nodes)
+                    counts_per_node = scatter_add(
+                        torch.ones_like(node_for_pair, dtype=torch.float, device=x.device),
+                        node_for_pair, dim=0, dim_size=num_nodes
+                    ).unsqueeze(1).clamp_min(1.0)
+                    m_node_final = sum_per_node / counts_per_node  # [N,d]
+                else:
+                    m_node_final = torch.zeros(num_nodes, units, device=x.device)
+
+                # Apply FiLM to edge deltas per (edge,inst), then mean across instances per edge
+                if edge_ids_all.numel() > 0:
+                    if enable_film:
+                        # Edge-conditional FiLM delta
+                        edge_cond_in = torch.cat([z_tensor[inst_ids_all], w_e0, dist_emb0, s_emb0, ctxu_emb0], dim=1)
+                        raw_dgamma_dbeta = self.edge_cond_film_mlps[l](edge_cond_in)
+                        raw_dgamma, raw_dbeta = raw_dgamma_dbeta.chunk(2, dim=1)
+                        # Remove clamping: use raw deltas
+                        dgamma = raw_dgamma
+                        dbeta = raw_dbeta
+                        gei_base = gamma_e[inst_ids_all]
+                        bei_base = beta_e[inst_ids_all]
+                        gei = gei_base + dgamma
+                        bei = bei_base + dbeta
+                    else:
+                        gei = gamma_e[inst_ids_all]
+                        bei = beta_e[inst_ids_all]
+                    edge_delta_ei_f = gei * edge_delta_ei + bei  # [num_pairs,d]
+                    messages_all = torch.zeros(num_edges, units, device=x.device)
+                    messages_all = messages_all.index_add(0, edge_ids_all, edge_delta_ei_f)
+                    counts_e = torch.zeros(num_edges, device=x.device)
+                    counts_e = counts_e.index_add(0, edge_ids_all, torch.ones_like(edge_ids_all, dtype=torch.float))
+                    messages_all = messages_all / torch.clamp_min(counts_e, 1.0).unsqueeze(1)
+                else:
+                    messages_all = torch.zeros(num_edges, units, device=x.device)
+
+                # Use node aggregate directly as agg for node update
+                agg = m_node_final
+            else:
+                # Original 'edge_first' path (current behavior with GAT-style pooling)
+                messages_all = torch.zeros(num_edges, units, device=x.device)
+                if edge_ids_all.numel() > 0:
+                    msg = self.message_mlps[l](x_emb[src_all])
+                    w_e = w_emb[edge_ids_all]
+                    z_i = enhanced_z_tensor[inst_ids_all]
+                    s_uvi = s_uvi_all
+                    ctx_uvi = ctx_uvi_all
+                    dist = dist_all
+                    dist_emb = self.dist_embedder(dist.unsqueeze(1))
+                    s_uvi_emb = self.s_uvi_embedder(s_uvi.unsqueeze(1)) if s_uvi.numel() > 0 else torch.zeros_like(dist_emb)
+                    ctx_uvi_emb = self.ctx_uvi_embedder(ctx_uvi.unsqueeze(1)) if ctx_uvi.numel() > 0 else torch.zeros_like(dist_emb)
+                    suvi_ctx_emb = s_uvi_emb + ctx_uvi_emb
+                    gate_input = torch.cat([z_i, w_e + suvi_ctx_emb], dim=1)
+                    gate = 1.0 + torch.tanh(self.gate_mlps[l](gate_input))
+                    film_input = z_i + dist_emb + suvi_ctx_emb
                     film_out = self.shared_film_mlp(film_input)
                     gamma, beta = film_out.chunk(2, dim=1)
-                    
                     mod_msg = gate * (gamma * msg + beta)
-                    
-                    messages_all = messages_all + scatter_add(mod_msg, edge_ids, dim=0, dim_size=num_edges)
-                    counts = counts + scatter_add(torch.ones_like(edge_ids, dtype=torch.float), edge_ids, dim=0, dim_size=num_edges)
-                    
-                    mask = counts > 0
-                    messages_all = torch.where(mask.unsqueeze(1), messages_all / counts.unsqueeze(1), messages_all)
-            
-            agg = torch.zeros(num_nodes, units, device=x.device)
-            dst = edge_index[0]
-            agg = agg.index_add(0, dst, messages_all)
+                    att_logits = self.att_mlps[l](gate_input).squeeze(-1)
+                    att_alpha = softmax(att_logits, edge_ids_all, num_nodes=num_edges)
+                    weighted_msg = att_alpha.unsqueeze(1) * mod_msg
+                    messages_all = messages_all + scatter_add(weighted_msg, edge_ids_all, dim=0, dim_size=num_edges)
+                if debug_enabled:
+                    assert messages_all.size(0) == num_edges, "messages_all first dim mismatch"
+                    assert not torch.isnan(messages_all).any(), "messages_all has NaN"
+                    assert not torch.isinf(messages_all).any(), "messages_all has Inf"
+                    torch.cuda.synchronize(messages_all.device) if messages_all.is_cuda else None
+            if self.aggregation_mode != 'instance_first':
+                agg = torch.zeros(num_nodes, units, device=x.device)
+                dst = edge_index[0]
+                agg = agg.index_add(0, dst, messages_all)
             
             if self.use_residual_norm:
                 node_residual = x_emb
@@ -328,64 +575,61 @@ class InstanceAwareHypergraphGNN(nn.Module):
             dst = edge_index[0]
             w1 = self.edge_update_mlps[l](w_emb)
             edge_node_contrib = self.edge_node_mlps[l](x_emb[src]) + self.edge_node_mlps[l](x_emb[dst])
+            # Incorporate cross-instance edge delta aggregate when in instance_first mode
+            if self.aggregation_mode == 'instance_first':
+                edge_update_input = w1 + edge_node_contrib + messages_all
+            else:
+                edge_update_input = w1 + edge_node_contrib
             
             if self.use_residual_norm:
                 edge_residual = w_emb
-                edge_update = w1 + edge_node_contrib
+                edge_update = edge_update_input
                 edge_update = edge_residual + edge_update  # Residual connection first
                 w_emb = self.act_fn(self.e_lns[l](edge_update))  # Then LayerNorm and activation
             else:
-                w_emb = self.act_fn(self.e_bns[l](w1 + edge_node_contrib))
+                w_emb = self.act_fn(self.e_bns[l](edge_update_input))
             
-            if valid_mask.any():
-                z_tensor = scatter_mean(
-                    x_emb[valid_mask], 
-                    instance_tensor[valid_mask], 
+            if node_ids_concat.numel() > 0:
+                # Pre-attention instance readout
+                z_pre = scatter_mean(
+                    x_emb[node_ids_concat], 
+                    inst_ids_concat, 
                     dim=0, 
                     dim_size=num_instances
                 )
-                
+                # Masked center self-attention within each batch
                 instance_center_indices = []
                 for inst_id in range(num_instances):
                     if inst_id in instance_mapping and len(instance_mapping[inst_id]) > 0:
                         instance_center_indices.append(instance_mapping[inst_id][-1])
-                
                 if instance_center_indices:
                     instance_center_indices = torch.tensor(instance_center_indices, device=x.device)
                     instance_center_nodes = x_emb[instance_center_indices]  # [num_instances, units]
-                    
                     if num_instances > 1:
-                        updated_center_nodes = instance_center_nodes.clone()
-                        
-                        for batch_idx in range(batch_size):
-                            batch_start = batch_idx * seq_len
-                            batch_end = min((batch_idx + 1) * seq_len, num_instances)
-                            
-                            if batch_start < batch_end and batch_end - batch_start > 1:
-                                batch_center_nodes = instance_center_nodes[batch_start:batch_end]  # [batch_seq_len, units]
-                                
-                                batch_center_nodes = batch_center_nodes.unsqueeze(1)  # [batch_seq_len, 1, units]
-                                attn_out, _ = self.instance_self_attention[l](batch_center_nodes, batch_center_nodes, batch_center_nodes)
-                                updated_center_nodes[batch_start:batch_end] = attn_out.squeeze(1)  # [batch_seq_len, units]
-                        
-                        instance_center_nodes = updated_center_nodes
-                    
+                        H = instance_center_nodes.unsqueeze(0)  # [1, I, d]
+                        batch_ids = torch.arange(num_instances, device=x.device) // seq_len  # [I]
+                        same_batch = batch_ids.unsqueeze(0) == batch_ids.unsqueeze(1)  # [I,I]
+                        attn_mask = ~same_batch  # True means mask
+                        attn_out, _ = self.instance_self_attention[l](H, H, H, attn_mask=attn_mask)
+                        instance_center_nodes = attn_out.squeeze(0)
                     x_emb = x_emb.clone()
                     x_emb[instance_center_indices] = instance_center_nodes
-                    
-                    z_tensor_new = scatter_mean(
-                        x_emb[valid_mask], 
-                        instance_tensor[valid_mask], 
+                    # Post-attention instance readout
+                    z_post = scatter_mean(
+                        x_emb[node_ids_concat], 
+                        inst_ids_concat, 
                         dim=0, 
                         dim_size=num_instances
                     )
-                    if self.use_residual_norm:
-                        z_tensor_new = z_tensor_clean + z_tensor_new  
-                        z_tensor_clean = self.z_lns[l](z_tensor_new)  
-                        enhanced_z_tensor = z_tensor_clean + target_emb 
-                    else:
-                        z_tensor_clean = z_tensor_new
-                        enhanced_z_tensor = z_tensor_clean + target_emb 
+                else:
+                    z_post = z_pre
+                # Apply residual-norm pipeline and update tensors for next layer (z_post does not include target_emb)
+                if self.use_residual_norm:
+                    z_tensor_clean = self.z_lns[l](z_post)
+                else:
+                    z_tensor_clean = z_post
+                enhanced_z_tensor = z_tensor_clean + target_emb 
+                z_tensor = z_tensor_clean
         
         edge_predictions = torch.zeros(num_edges, num_instances, device=x.device)
         
@@ -401,8 +645,9 @@ class InstanceAwareHypergraphGNN(nn.Module):
                 inst_ids = torch.tensor(inst_ids, device=x.device)
                 edge_ids = torch.tensor(edge_ids, device=x.device)
                 
-                src = edge_index[0, edge_ids]
-                dst = edge_index[1, edge_ids]
+                # Align prediction direction with message passing: src = edge_index[1], dst = edge_index[0]
+                src = edge_index[1, edge_ids]
+                dst = edge_index[0, edge_ids]
                 w_edges = w_emb[edge_ids]
                 x_src = x_emb[src]
                 x_dst = x_emb[dst]
@@ -410,18 +655,25 @@ class InstanceAwareHypergraphGNN(nn.Module):
                 center_features = torch.zeros_like(x_src)
                 
                 if self.prediction_mode == 'dot_product':
+                    # For dot_product, use z without target_emb to avoid bias leakage
+                    z_i = z_tensor_clean[inst_ids]
                     edge_features = torch.cat([x_src, x_dst, w_edges, center_features], dim=1)  # [num_pairs, 4*units]
                     edge_emb = self.edge_mlp(edge_features)  # [num_pairs, units]
                     instance_emb = self.instance_mlp(z_i)  # [num_pairs, units]
-                    batch_predictions = torch.sigmoid(torch.sum(edge_emb * instance_emb, dim=1))  # [num_pairs]
+                    # Normalize and scale by learnable temperature for stable logits
+                    edge_emb = F.normalize(edge_emb, dim=1)
+                    instance_emb = F.normalize(instance_emb, dim=1)
+                    temperature = F.softplus(self.dot_temperature)
+                    batch_predictions = temperature * torch.sum(edge_emb * instance_emb, dim=1)  # [num_pairs]
                 else:  # mlp_concat
                     pred_features_raw = torch.cat([x_src, x_dst, w_edges, z_i, center_features], dim=1)
                     pred_features_projected = self.edge_projection(pred_features_raw)
-                    batch_predictions = torch.sigmoid(self.output_mlp(pred_features_projected)).squeeze(-1)
+                    # Return logits (no sigmoid).
+                    batch_predictions = self.output_mlp(pred_features_projected).squeeze(-1)
                 
                 edge_predictions[edge_ids, inst_ids] = batch_predictions
         
-        return x_emb, w_emb, z_tensor, edge_predictions
+        return x_emb, w_emb, z_tensor_clean, edge_predictions
     
 class MultiRelBasisHeteroGNN(nn.Module):
     """
@@ -656,6 +908,9 @@ class Net(nn.Module):
         self.use_instance_hypergraph = use_instance_hypergraph
         
         if use_instance_hypergraph:
+            import os
+            agg_mode = os.environ.get('TSP_AGGREGATION_MODE', 'edge_first')
+            share_film = os.environ.get('TSP_SHARE_FILM', '1') == '1'
             self.emb_net = InstanceAwareHypergraphGNN(
                 depth=args.emb_depth,
                 feats=2,  # 2D coordinates
@@ -665,7 +920,9 @@ class Net(nn.Module):
                 num_instances=num_instances,
                 num_heads=num_heads,
                 prediction_mode=prediction_mode,
-                use_residual_norm=use_residual_norm
+                use_residual_norm=use_residual_norm,
+                aggregation_mode=agg_mode,
+                share_film_across_layers=share_film
             )
         elif use_shared_basis_film:
             self.emb_net = SharedBasisFiLMAttentionGNN(

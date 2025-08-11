@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch_geometric.nn as gnn
-from torch_scatter import scatter_mean
+from torch_scatter import scatter_mean, scatter_max
 import torch_geometric.utils as g_utils
 from torch_geometric.nn import global_mean_pool
 import math
@@ -9,6 +9,7 @@ from ..tsp_nets import Net, MultiRelBasisEmbNet
 from scipy.spatial import Delaunay
 import torch.nn.functional as F
 import time
+import os
 
 class Args:
     """
@@ -250,108 +251,57 @@ class TSPGraphEncoder(nn.Module):
         
         return final_output
 
-    def _build_graph_edges(self, valid_coords, num_valid_nodes, candidate_info, pos, b, batch_size, device):
-        def _create_complete_graph(num_nodes, device):
-            if num_nodes <= 1:
-                return torch.empty((2, 0), dtype=torch.long, device=device)
-            
-            nodes = torch.arange(num_nodes, device=device)
-            src_nodes = nodes.unsqueeze(1).expand(-1, num_nodes).flatten()
-            dst_nodes = nodes.unsqueeze(0).expand(num_nodes, -1).flatten()
-            
-            non_self_mask = src_nodes != dst_nodes
-            edge_index = torch.stack([src_nodes[non_self_mask], dst_nodes[non_self_mask]], dim=0)
-            return edge_index
-
-        def _vectorized_knn_lkh3_edges_optimized(valid_coords, num_valid_nodes, candidate_info, pos, b, batch_size, device, max_candidates):
-            if num_valid_nodes <= 1:
-                return torch.empty((2, 0), dtype=torch.long, device=device)
-            
-            target_edges_per_node = min(max_candidates, num_valid_nodes - 1)
-            
-            dist_matrix = torch.cdist(valid_coords, valid_coords, p=2)
-            k_neighbors = min(target_edges_per_node + 1, num_valid_nodes)  # +1 for self
-            _, nearest_indices = torch.topk(-dist_matrix, k_neighbors, dim=1)
-            
-            node_candidates = {}
-            if candidate_info is not None:
-                candidate_idx = pos * batch_size + b
-                if candidate_idx < len(candidate_info) and candidate_info[candidate_idx] is not None:
-                    cand_info = candidate_info[candidate_idx]
-                    
+    def _build_graph_edges(self, valid_coords, num_valid_nodes, candidate_info, pos, b, batch_size, seq_len, device):
+        """
+        Simplified graph edge building: candidate edges + KNN edges with deduplication
+        """
+        if num_valid_nodes <= 1:
+            return torch.empty((2, 0), dtype=torch.long, device=device), torch.empty((0, 1), device=device)
+        
+        candidate_edges = set()
+        
+        # Use batch-major flattening for fix_group_nodes_same_size: idx = b * seq_len + pos
+        candidate_idx = b * seq_len + pos
+        if candidate_idx < len(candidate_info) and candidate_info[candidate_idx] is not None:
+            cand_info = candidate_info[candidate_idx]
+            if 'candidates' in cand_info:
                     for node_id, candidates in cand_info['candidates'].items():
-                        src_node = node_id - 1
+                        src_node = node_id - 1  
                         if src_node < num_valid_nodes:
-                            valid_candidates = []
                             for neighbor_id, alpha_value in candidates:
                                 dst_node = neighbor_id - 1
                                 if dst_node < num_valid_nodes and dst_node != src_node:
-                                    valid_candidates.append((dst_node, alpha_value))
-                            if valid_candidates:
-                                node_candidates[src_node] = valid_candidates
-            
-            edge_pairs_set = set()
-            
-            for node in range(num_valid_nodes):
-                lkh3_candidates = node_candidates.get(node, [])
-                lkh3_candidates.sort(key=lambda x: x[1])  
-                
-                added_for_node = 0
-                
-                for neighbor, alpha in lkh3_candidates:
-                    if added_for_node >= target_edges_per_node:
-                        break
-                    if neighbor != node:
-                        edge_pair = (min(node, neighbor), max(node, neighbor))
-                        if edge_pair not in edge_pairs_set:
-                            edge_pairs_set.add(edge_pair)
-                        added_for_node += 1
-                
-                if added_for_node < target_edges_per_node:
-                    neighbors = nearest_indices[node]
-                    for neighbor_tensor in neighbors:
-                        if added_for_node >= target_edges_per_node:
-                            break
-                        neighbor_idx = neighbor_tensor.item()
-                        if neighbor_idx != node:
-                            edge_pair = (min(node, neighbor_idx), max(node, neighbor_idx))
-                            if edge_pair not in edge_pairs_set:
-                                edge_pairs_set.add(edge_pair)
-                            added_for_node += 1
-            
-            if edge_pairs_set:
-                edge_pairs = list(edge_pairs_set)
-                min_nodes, max_nodes = zip(*edge_pairs)
-                
-                src_nodes = list(min_nodes) + list(max_nodes)
-                dst_nodes = list(max_nodes) + list(min_nodes)
-                
-                edge_index = torch.tensor([src_nodes, dst_nodes], dtype=torch.long, device=device)
-            else:
-                edge_index = torch.empty((2, 0), dtype=torch.long, device=device)
-            
-            return edge_index
-
-        # Use optimized vectorized implementation
-        if candidate_info is not None or num_valid_nodes > 1:
-            edge_index = _vectorized_knn_lkh3_edges_optimized(
-                valid_coords, num_valid_nodes, candidate_info, pos, b, batch_size, device, self.max_candidates
-            )
+                                    # Add bidirectional edges
+                                    candidate_edges.add((src_node, dst_node))
+                                    candidate_edges.add((dst_node, src_node))
+        
+        k = min(self.max_candidates, num_valid_nodes - 1)  # Ensure k is valid
+        if k > 0:
+            knn_edge_index = gnn.knn_graph(valid_coords, k=k, batch=None, loop=False)
+            knn_edges = set()
+            for i in range(knn_edge_index.size(1)):
+                src, dst = knn_edge_index[0, i].item(), knn_edge_index[1, i].item()
+                knn_edges.add((src, dst))
         else:
-            edge_index = _create_complete_graph(num_valid_nodes, device)
+            knn_edges = set()
         
-        # Fallback to complete graph if no edges generated
-        if edge_index.size(1) == 0 and num_valid_nodes > 1:
-            edge_index = _create_complete_graph(num_valid_nodes, device)
+        all_edges = candidate_edges.union(knn_edges)
         
-        # OPTIMIZATION: Vectorized edge attribute computation
+        # Convert to tensor
+        if all_edges:
+            edge_list = list(all_edges)
+            edge_index = torch.tensor(edge_list, device=device, dtype=torch.long).t()
+        else:
+            edge_index = torch.empty((2, 0), dtype=torch.long, device=device)
+    
         if edge_index.size(1) > 0:
-            rows, cols = edge_index
-            edge_attr = torch.norm(valid_coords[rows] - valid_coords[cols], dim=1).unsqueeze(1)
+            src_nodes = edge_index[0]
+            dst_nodes = edge_index[1]
+            edge_distances = torch.norm(valid_coords[src_nodes] - valid_coords[dst_nodes], dim=1, keepdim=True)
         else:
-            edge_attr = torch.empty((0, 1), dtype=torch.float32, device=device)
-        
-        return edge_index, edge_attr
+            edge_distances = torch.empty((0, 1), device=device)
+    
+        return edge_index, edge_distances
 
     def _build_tour_edges(self, tour, valid_indices, num_valid_nodes, valid_coords, device):
         """
@@ -450,9 +400,11 @@ class TSPGraphEncoder(nn.Module):
                     # Use 1e8 for quantization to achieve 1e-8 precision threshold for coordinate merging
                     coords_quantized = (valid_coords * 1e8).round().long()
                     total_nodes_batch += num_valid_nodes
+
+                    coords_quantized_cpu = coords_quantized.cpu().tolist()
                         
                     for local_idx in range(num_valid_nodes):
-                        coord_key = tuple(coords_quantized[local_idx].cpu().tolist())
+                        coord_key = tuple(coords_quantized_cpu[local_idx])
                             
                         if coord_key not in coord_to_global_idx_batch:
                             global_idx = len(unique_coords_batch)
@@ -527,7 +479,7 @@ class TSPGraphEncoder(nn.Module):
                     
                     # Build graph edges
                     local_graph_edges, graph_edge_attrs = self._build_graph_edges(
-                        valid_coords, num_valid_nodes, candidate_info, pos, batch_idx, batch_size, x.device
+                        valid_coords, num_valid_nodes, candidate_info, pos, batch_idx, batch_size, seq_len, x.device
                     )
                     
                     if local_graph_edges.size(1) > 0:
@@ -777,7 +729,7 @@ class TSPGraphEncoder(nn.Module):
                 
                 # Build graph edges for this instance
                 graph_edges, graph_edge_attrs = self._build_graph_edges(
-                    valid_coords, num_valid_nodes, candidate_info, pos, batch_idx, batch_size, x.device
+                    valid_coords, num_valid_nodes, candidate_info, pos, batch_idx, batch_size, seq_len, x.device
                 )
                 
                 if self.edge_type_mode == 'triple':
@@ -924,48 +876,19 @@ class TSPGraphEncoder(nn.Module):
                         edge_list.append(center_edges)
                         edge_attr_list.append(center_edge_attrs)
                     
-                    # Combine all edges with single edge type (type 0)
-                    if edge_list:
-                        all_edges = torch.cat(edge_list, dim=1)
-                        all_edge_attrs = torch.cat(edge_attr_list, dim=0)
-                        # Use single edge type (type 0) for ALL edges including center edges
-                        type_indices = torch.zeros(all_edges.size(1), device=x.device, dtype=torch.long)
-                    else:
-                        all_edges = torch.empty((2, 0), dtype=torch.long, device=x.device)
-                        all_edge_attrs = torch.empty((0, 3), device=x.device)
-                        type_indices = torch.empty((0,), dtype=torch.long, device=x.device)
-                
-                # Apply forward filtering if needed
-                if self.loss_direction_mode == 'forward' and all_edges.size(1) > 0:
-                    if self.edge_type_mode == 'triple':
-                        # Filter only graph and tour edges, keep center edges as they are
-                        forward_mask = torch.ones(all_edges.size(1), dtype=torch.bool, device=x.device)
-                        
-                        # Apply filtering to non-center edges only
-                        non_center_mask = type_indices != 2
-                        if non_center_mask.any():
-                            edge_forward_condition = all_edges[0] < all_edges[1]
-                            forward_mask = forward_mask & (~non_center_mask | edge_forward_condition)
-                        
-                    all_edges = all_edges[:, forward_mask]
-                    all_edge_attrs = all_edge_attrs[forward_mask]
-                    type_indices = type_indices[forward_mask]
+                                    # Combine all edges with single edge type (type 0)
+                if edge_list:
+                    all_edges = torch.cat(edge_list, dim=1)
+                    all_edge_attrs = torch.cat(edge_attr_list, dim=0)
+                    # Use single edge type (type 0) for ALL edges including center edges
+                    type_indices = torch.zeros(all_edges.size(1), device=x.device, dtype=torch.long)
                 else:
-                    # For single edge mode, apply filtering but exclude center edges
-                    forward_mask = torch.ones(all_edges.size(1), dtype=torch.bool, device=x.device)
-                    
-                    # Identify center edges (edges involving center_node_idx)
-                    center_edge_mask = (all_edges[0] == center_node_idx) | (all_edges[1] == center_node_idx)
-                    
-                    # Apply forward filtering only to non-center edges
-                    non_center_mask = ~center_edge_mask
-                    if non_center_mask.any():
-                        edge_forward_condition = all_edges[0] < all_edges[1]
-                        forward_mask = forward_mask & (~non_center_mask | edge_forward_condition)
-                    
-                    all_edges = all_edges[:, forward_mask]
-                    all_edge_attrs = all_edge_attrs[forward_mask]
-                    type_indices = type_indices[forward_mask]
+                    all_edges = torch.empty((2, 0), dtype=torch.long, device=x.device)
+                    all_edge_attrs = torch.empty((0, 3), device=x.device)
+                    type_indices = torch.empty((0,), dtype=torch.long, device=x.device)
+                
+                # Note: Direction filtering is now handled in loss calculation, not here
+                # All modes build complete bidirectional graphs for optimal GNN performance
                 
                 num_edges = all_edges.size(1)
                 total_nodes = len(extended_coords)  # Use actual number of nodes
@@ -1110,11 +1033,72 @@ class TSPGraphEncoder(nn.Module):
             'edge_predictions': edge_values_padded
         }
 
+    def _empty_instance_hypergraph_result(self, seq_len, batch_size, eval_start_pos, device):
+        """Return empty result for instance hypergraph when no valid coordinates exist."""
+        seq_eval_len = seq_len - eval_start_pos
+        node_embs = torch.zeros(seq_len, batch_size, self.emsize, device=device)
+        edge_embs = None
+        z_instances = {}
+        all_predictions = torch.empty(0, device=device)
+        
+        # Create empty eval_infos
+        eval_infos = []
+        for pos in range(eval_start_pos, seq_len):
+            for batch_idx in range(batch_size):
+                eval_infos.append({
+                    'pos': pos,
+                    'batch': batch_idx,
+                    'instance_id': len(eval_infos),
+                    'num_valid_nodes': 0,
+                    'valid_indices': torch.empty(0, dtype=torch.long, device=device),
+                    'node_offset_map': {},
+                    'city_node_indices': [],
+                    'edge_index': torch.empty((2, 0), dtype=torch.long, device=device)
+                })
+        
+        edge_info = {
+            'embeddings': edge_embs,
+            'indices': torch.empty((2, 0), dtype=torch.long, device=device),
+            'batch': None,
+            'position': None,
+            'node_offset_map': {},
+            'edge_counts': [0] * len(eval_infos),
+            'eval_infos': eval_infos,
+            'instance_mapping': {},
+            'z_instances': z_instances,
+            'all_predictions': all_predictions,
+            'coordinate_merging_enabled': self.merge_duplicate_coords,
+            'global_to_originals': {},
+            'edge_to_instances': {},
+            'instance_to_edges': {},
+            's_uvi_matrix': torch.empty((0, 0), dtype=torch.float32, device=device)
+        }
+        
+        final_output = {
+            'node_embeddings': node_embs,
+            'edge_info': edge_info,
+            'direct_predictions': True,
+            'edge_predictions': torch.zeros(seq_eval_len, batch_size, 1, device=device)
+        }
+        
+        return final_output
+
     def _forward_instance_hypergraph(self, x, y, candidate_info, single_eval_pos=None):
         """
         InstanceAwareHypergraphGNN forward pass.
-        OPTIMIZED: Per-instance coordinate deduplication and efficient edge building.
+        VECTORIZED: Global node deduplication, then each instance generates max_candidates edges, finally global edge deduplication
         """
+        # Lightweight debug flag (env-controlled; no graph changes when disabled)
+        debug_enabled = os.environ.get('TSP_DEBUG_GUARDS', '0') == '1'
+        def _cuda_sync_if_needed(t):
+            if debug_enabled and isinstance(t, torch.Tensor) and t.is_cuda:
+                torch.cuda.synchronize(t.device)
+        def _assert_tensor_ok(t, name):
+            if debug_enabled and isinstance(t, torch.Tensor) and t.numel() > 0:
+                assert not torch.isnan(t).any(), f"{name} has NaN"
+                assert not torch.isinf(t).any(), f"{name} has Inf"
+                _cuda_sync_if_needed(t)
+
         seq_len, batch_size, max_num_nodes, _ = x.shape
         eval_start_pos = single_eval_pos or seq_len - 1
         
@@ -1122,20 +1106,15 @@ class TSPGraphEncoder(nn.Module):
         if self.merge_duplicate_coords:
             time_a = time.time()
             
-            # OPTIMIZATION: Per-instance coordinate deduplication
-            all_unique_coords = []
-            global_coord_offset = 0
-            instance_mapping = {}
-            node_offset_map = {}
-            eval_infos = []
-            global_to_originals = {}
-            
-            instance_id = 0
-            total_nodes = 0
-            merged_count = 0
-            
-            for pos in range(seq_len):
-                for batch_idx in range(batch_size):
+            # STEP 1: Batch-wise node deduplication and mapping
+            def process_batch_coordinates(batch_idx):
+                """Process coordinates for a single batch, performing deduplication within batch"""
+                batch_coords = []
+                # batch_instance_info = []
+                batch_instance_id = 0
+                
+                # Collect all valid coordinates for this batch
+                for pos in range(seq_len):
                     coords = x[pos, batch_idx]
                     valid_mask = (coords[:, 0] != -1) & (coords[:, 1] != -1)
                     valid_indices = torch.where(valid_mask)[0]
@@ -1145,43 +1124,76 @@ class TSPGraphEncoder(nn.Module):
                         continue
                     
                     valid_coords = coords[valid_mask]
-                    total_nodes += num_valid_nodes
+                    batch_coords.append(valid_coords)
                     
-                    # OPTIMIZATION: Per-instance coordinate deduplication
+                    # # Record instance information for this batch
+                    # for local_idx, valid_idx in enumerate(valid_indices):
+                    #     batch_instance_info.append({
+                    #         'pos': pos,
+                    #         'batch': batch_idx,
+                    #         'orig_idx': valid_idx.item(),
+                    #         'local_idx': local_idx,
+                    #         'instance_id': batch_instance_id
+                    #     })
+                    
+                    batch_instance_id += 1
+                
+                if not batch_coords:
+                    return None, None, None, None, None, None
+                
+                # Batch-wise coordinate deduplication
+                batch_coords_tensor = torch.cat(batch_coords, dim=0)
+                batch_coords_quantized = (batch_coords_tensor * 1e8).round().long()
+                
+                # Use torch.unique for batch-wise deduplication
+                unique_coords, inverse_indices = torch.unique(batch_coords_quantized, dim=0, return_inverse=True, sorted=False)
+                
+                # Build batch mapping relationships
+                coord_to_global_idx = {}
+                global_to_originals = {}
+                instance_mapping = {}
+                node_offset_map = {}
+                eval_infos = []
+            
+                                # Assign global index for each unique coordinate in this batch
+                unique_coords_cpu = unique_coords.cpu().tolist()
+                for i, unique_coord in enumerate(unique_coords_cpu):
+                    coord_key = tuple(unique_coord)
+                    coord_to_global_idx[coord_key] = i
+                    global_to_originals[i] = []
+                
+                # Build instance_mapping and node_offset_map for this batch
+                current_instance = 0
+                for pos in range(seq_len):
+                    coords = x[pos, batch_idx]
+                    valid_mask = (coords[:, 0] != -1) & (coords[:, 1] != -1)
+                    valid_indices = torch.where(valid_mask)[0]
+                    num_valid_nodes = len(valid_indices)
+                    
+                    if num_valid_nodes == 0:
+                        continue
+                    
+                    valid_coords = coords[valid_mask]
                     coords_quantized = (valid_coords * 1e8).round().long()
-                    coord_keys = [tuple(coord.cpu().tolist()) for coord in coords_quantized]
                     
-                    # Local deduplication for this instance
-                    local_unique_coords = []
-                    local_coord_to_idx = {}
                     city_node_indices = []
-                    
-                    for local_idx, coord_key in enumerate(coord_keys):
-                        if coord_key not in local_coord_to_idx:
-                            local_coord_to_idx[coord_key] = len(local_unique_coords)
-                            local_unique_coords.append(valid_coords[local_idx])
-                            merged_count += 1
-                        
-                        global_idx = global_coord_offset + local_coord_to_idx[coord_key]
+                    coords_quantized_cpu = coords_quantized.cpu().tolist()
+                    for local_idx, coord in enumerate(coords_quantized_cpu):
+                        coord_key = tuple(coord)
+                        global_idx = coord_to_global_idx[coord_key]
                         city_node_indices.append(global_idx)
                         
                         orig_node_idx = valid_indices[local_idx].item()
                         node_offset_map[(pos, batch_idx, orig_node_idx)] = global_idx
-                        
-                        if global_idx not in global_to_originals:
-                            global_to_originals[global_idx] = []
                         global_to_originals[global_idx].append((pos, batch_idx, orig_node_idx))
                     
-                    all_unique_coords.extend(local_unique_coords)
-                    global_coord_offset += len(local_unique_coords)
-                    
-                    instance_mapping[instance_id] = city_node_indices.copy()
+                    instance_mapping[current_instance] = city_node_indices.copy()
                     
                     if pos >= eval_start_pos:
                         eval_infos.append({
                             'pos': pos,
                             'batch': batch_idx,
-                            'instance_id': instance_id,
+                            'instance_id': current_instance,
                             'num_valid_nodes': num_valid_nodes,
                             'valid_indices': valid_indices,
                             'node_offset_map': {k: v for k, v in node_offset_map.items() 
@@ -1189,332 +1201,494 @@ class TSPGraphEncoder(nn.Module):
                             'city_node_indices': city_node_indices
                         })
                     
-                    instance_id += 1
+                    current_instance += 1
             
-            # OPTIMIZATION: Add center nodes efficiently
-            center_node_start_idx = len(all_unique_coords)
-            instance_id = 0
+                return unique_coords, coord_to_global_idx, global_to_originals, instance_mapping, node_offset_map, eval_infos
             
-            for pos in range(seq_len):
-                for batch_idx in range(batch_size):
-                    coords = x[pos, batch_idx]
-                    valid_mask = (coords[:, 0] != -1) & (coords[:, 1] != -1)
-                    num_valid_nodes = len(valid_indices := torch.where(valid_mask)[0])
+            # Process all batches
+            all_unique_coords = []
+            all_coord_to_global_idx = {}
+            all_global_to_originals = {}
+            all_instance_mapping = {}
+            all_node_offset_map = {}
+            all_eval_infos = []
+            
+            global_node_offset = 0
+            global_instance_offset = 0
+            
+            for batch_idx in range(batch_size):
+                result = process_batch_coordinates(batch_idx)
+                if result[0] is not None:
+                    unique_coords, coord_to_global_idx, global_to_originals, instance_mapping, node_offset_map, eval_infos = result
                     
-                    if num_valid_nodes == 0:
-                        continue
+                    # Adjust global indices for this batch
+                    batch_unique_coords = unique_coords
+                    batch_coord_to_global_idx = {}
+                    batch_global_to_originals = {}
+                    batch_instance_mapping = {}
+                    batch_node_offset_map = {}
+                    batch_eval_infos = []
                     
-                    valid_coords = coords[valid_mask]
-                    center_coord = valid_coords.mean(dim=0)
+                    # Remap global indices with offset
+                    for coord_key, old_global_idx in coord_to_global_idx.items():
+                        new_global_idx = old_global_idx + global_node_offset
+                        batch_coord_to_global_idx[coord_key] = new_global_idx
+                        batch_global_to_originals[new_global_idx] = global_to_originals[old_global_idx]
+                    
+                    # Update instance mapping with new global indices AND global instance offset
+                    for instance_id, city_node_indices in instance_mapping.items():
+                        new_instance_id = instance_id + global_instance_offset
+                        batch_instance_mapping[new_instance_id] = [idx + global_node_offset for idx in city_node_indices]
+                    
+                    # Update node offset map with new global indices
+                    for key, old_global_idx in node_offset_map.items():
+                        batch_node_offset_map[key] = old_global_idx + global_node_offset
+                    
+                    # Update eval infos with new global indices AND global instance offset
+                    for eval_info in eval_infos:
+                        new_eval_info = eval_info.copy()
+                        new_eval_info['city_node_indices'] = [idx + global_node_offset for idx in eval_info['city_node_indices']]
+                        new_eval_info['node_offset_map'] = {k: v + global_node_offset for k, v in eval_info['node_offset_map'].items()}
+                        new_eval_info['instance_id'] = eval_info['instance_id'] + global_instance_offset
+                        batch_eval_infos.append(new_eval_info)
+                    
+                    # Accumulate results
+                    all_unique_coords.append(batch_unique_coords)
+                    all_coord_to_global_idx.update(batch_coord_to_global_idx)
+                    all_global_to_originals.update(batch_global_to_originals)
+                    all_instance_mapping.update(batch_instance_mapping)
+                    all_node_offset_map.update(batch_node_offset_map)
+                    all_eval_infos.extend(batch_eval_infos)
+                    
+                    global_node_offset += len(unique_coords)
+                    global_instance_offset += len(instance_mapping)
+            
+            # Combine all unique coordinates from all batches
+            merged_coords = torch.cat(all_unique_coords, dim=0).float()/1e8
+            coord_to_global_idx = all_coord_to_global_idx
+            global_to_originals = all_global_to_originals
+            instance_mapping = all_instance_mapping
+            node_offset_map = all_node_offset_map
+            eval_infos = all_eval_infos
+            
+            # Add center nodes for each instance
+            center_coords = []
+            center_node_start_idx = len(merged_coords)
+            
+            for instance_id in range(len(instance_mapping)):
+                city_node_indices = instance_mapping[instance_id]
+                if len(city_node_indices) > 0:
+                    # Calculate center coordinate from city nodes
+                    city_coords = merged_coords[city_node_indices].float()  # Ensure float type
+                    center_coord = city_coords.mean(dim=0)
+                    center_coords.append(center_coord)
+                    
+                    # Add center node to instance mapping
                     center_node_idx = center_node_start_idx + instance_id
-                    all_unique_coords.append(center_coord)
-                    
                     instance_mapping[instance_id].append(center_node_idx)
                     
-                    # Update eval info with center node
-                    if pos >= eval_start_pos:
-                        for eval_info in eval_infos:
-                            if eval_info['instance_id'] == instance_id:
-                                eval_info['center_node_idx'] = center_node_idx
-                                break
-                    
-                    instance_id += 1
+                    # Update eval_info if this is an evaluation instance
+                    if instance_id < len(eval_infos):
+                        eval_infos[instance_id]['center_node_idx'] = center_node_idx
             
-            # OPTIMIZATION: Efficient edge building with pre-allocation (全向量化重构)
-            merged_coords = torch.stack(all_unique_coords, dim=0) if all_unique_coords else torch.empty((0, 2), device=x.device)
-
-            # 1. 批量收集所有instance的边
-            all_u, all_v, all_instance_id, all_edge_type = [], [], [], []
+            # Combine city nodes and center nodes
+            if center_coords:
+                center_coords_tensor = torch.stack(center_coords, dim=0)
+                merged_coords = torch.cat([merged_coords, center_coords_tensor], dim=0)
+            
+            # STEP 2: Vectorized edge building (maintaining one-to-many information)
+            
+            # Batch build edges for all instances
+            all_edges = []
+            all_instance_ids = []
+            all_edge_types = []
+            edge_to_instances = {}
+            instance_to_edges = {}
+            
             for instance_id in range(len(instance_mapping)):
-                city_node_indices = instance_mapping[instance_id][:-1]
+                city_node_indices = instance_mapping[instance_id][:-1]  # Exclude center node
                 center_node_idx = instance_mapping[instance_id][-1]
                 num_nodes = len(city_node_indices)
+                
                 if num_nodes == 0:
                     continue
-                # 构建图边（KNN/candidate）
+                
+                # Build graph edges
                 valid_coords = merged_coords[city_node_indices]
+                # Correct mapping from instance_id to (pos, batch) based on construction order
                 local_graph_edges, _ = self._build_graph_edges(
-                    valid_coords, num_nodes, candidate_info, instance_id // batch_size, instance_id % batch_size, batch_size, x.device
+                    valid_coords, num_nodes, candidate_info, instance_id % seq_len, instance_id // seq_len, batch_size, seq_len, x.device
                 )
+                
                 if local_graph_edges.size(1) > 0:
-                    # 映射到全局索引
+                    # Map to global indices
                     city_indices_tensor = torch.tensor(city_node_indices, device=x.device, dtype=torch.long)
                     global_graph_edges = city_indices_tensor[local_graph_edges]
-                    all_u.append(global_graph_edges[0])
-                    all_v.append(global_graph_edges[1])
-                    all_instance_id.append(torch.full((global_graph_edges.size(1),), instance_id, device=x.device, dtype=torch.long))
-                    all_edge_type.append(torch.zeros(global_graph_edges.size(1), device=x.device, dtype=torch.long))
-                # 构建中心边
+                    
+                    # Add graph edges
+                    all_edges.append(global_graph_edges)
+                    all_instance_ids.extend([instance_id] * global_graph_edges.size(1))
+                    all_edge_types.extend([0] * global_graph_edges.size(1))
+                
+                # Build center edges
                 if num_nodes > 0:
                     city_indices = torch.tensor(city_node_indices, device=x.device, dtype=torch.long)
                     center_indices = torch.full_like(city_indices, center_node_idx)
-                    all_u.append(city_indices)
-                    all_v.append(center_indices)
-                    all_instance_id.append(torch.full((city_indices.size(0),), instance_id, device=x.device, dtype=torch.long))
-                    all_edge_type.append(torch.ones(city_indices.size(0), device=x.device, dtype=torch.long))
-            if all_u:
-                all_u = torch.cat(all_u)
-                all_v = torch.cat(all_v)
-                all_instance_id = torch.cat(all_instance_id)
-                all_edge_type = torch.cat(all_edge_type)
-            else:
-                all_u = torch.empty(0, dtype=torch.long, device=x.device)
-                all_v = torch.empty(0, dtype=torch.long, device=x.device)
-                all_instance_id = torch.empty(0, dtype=torch.long, device=x.device)
-                all_edge_type = torch.empty(0, dtype=torch.long, device=x.device)
-            # 2. 全局有向边去重
-            edge_pairs = torch.stack([all_u, all_v], dim=0)  # [2, E]，有向边
-            unique_edges, inverse_indices = torch.unique(edge_pairs.t(), dim=0, return_inverse=True)
-            merged_edges = unique_edges.t()  # [2, num_unique_edges]
-            num_unique_edges = merged_edges.size(1)
+                    center_edges = torch.stack([city_indices, center_indices], dim=0)
+                    
+                    all_edges.append(center_edges)
+                    all_instance_ids.extend([instance_id] * center_edges.size(1))
+                    all_edge_types.extend([1] * center_edges.size(1))
+            
+            # Merge all edges
+                merged_edges = torch.cat(all_edges, dim=1)
+                instance_ids = torch.tensor(all_instance_ids, device=x.device, dtype=torch.long)
+                edge_types = torch.tensor(all_edge_types, device=x.device, dtype=torch.long)
+            
+            # STEP 3: Build edge-to-instance mapping (maintaining one-to-many information)
+            num_total_edges = merged_edges.size(1)
             num_instances_total = len(instance_mapping)
-            # 3. 批量计算边属性
-            edge_attr = torch.norm(merged_coords[merged_edges[0]] - merged_coords[merged_edges[1]], dim=1, keepdim=True)
-            # 4. instance到边、边到instance的映射
-            # 对于每个instance，找到其所有边在unique_edges中的索引
-            instance_to_edges = {}
-            edge_to_instances = {}
-            for idx, (inst_id, inv_idx) in enumerate(zip(all_instance_id.cpu().tolist(), inverse_indices.cpu().tolist())):
+            
+            # Build edge_to_instances and instance_to_edges mappings
+            for edge_idx in range(num_total_edges):
+                inst_id = instance_ids[edge_idx].item()
+                
+                # Update instance_to_edges
                 if inst_id not in instance_to_edges:
                     instance_to_edges[inst_id] = set()
-                instance_to_edges[inst_id].add(inv_idx)
-                if inv_idx not in edge_to_instances:
-                    edge_to_instances[inv_idx] = set()
-                edge_to_instances[inv_idx].add(inst_id)
+                instance_to_edges[inst_id].add(edge_idx)
+                
+                # Update edge_to_instances
+                if edge_idx not in edge_to_instances:
+                    edge_to_instances[edge_idx] = set()
+                edge_to_instances[edge_idx].add(inst_id)
+            
+            # STEP 3.5: Edge deduplication and mapping update
+            if self.merge_duplicate_coords:
+                # Simple and efficient edge deduplication
+                src, dst = merged_edges[0], merged_edges[1]
+                num_nodes = merged_coords.size(0)
+                edge_keys = src * num_nodes + dst
+                unique_keys, inverse_indices, counts = torch.unique(edge_keys, return_inverse=True, return_counts=True, sorted=False)
+
+                edge_types = scatter_max(edge_types, inverse_indices, dim=0)[0]
+                new_src = unique_keys // num_nodes
+                new_dst = unique_keys % num_nodes
+                merged_edges = torch.stack([new_src, new_dst], dim=0)
+
+                new_edge_to_instances = {i: [] for i in range(unique_keys.shape[0])}
+                new_instance_to_edges = {i: [] for i in range(num_instances_total)}
+
+                inverse_indices = inverse_indices.cpu().numpy()
+                for old_idx, inst_list in edge_to_instances.items():
+                    new_idx = inverse_indices[old_idx]
+                    new_edge_to_instances[new_idx].extend(inst_list)
+                    for inst_id in inst_list:
+                        new_instance_to_edges[inst_id].append(new_idx)
+
+                edge_to_instances = new_edge_to_instances
+                instance_to_edges = new_instance_to_edges
+            
+            # Convert to lists for easier processing
             for k in instance_to_edges:
                 instance_to_edges[k] = list(instance_to_edges[k])
             for k in edge_to_instances:
                 edge_to_instances[k] = list(edge_to_instances[k])
-            merged_edge_attrs = edge_attr
-            # --- s_uvi_matrix generation ---
-            # s_uvi_matrix: [num_unique_edges, num_instances], 1 if edge is solution in instance, else 0
-            s_uvi_matrix = torch.zeros((num_unique_edges, num_instances_total), dtype=torch.float32, device=x.device)
-            # For each instance, mark solution edges
-            for eval_info in eval_infos:
-                instance_id = eval_info['instance_id']
-                city_node_indices = eval_info['city_node_indices']
-                valid_indices = eval_info['valid_indices']
-                pos = eval_info['pos']
-                batch = eval_info['batch']
-                # Get tour for this instance
-                if y is not None and valid_indices is not None and len(valid_indices) > 1:
-                    tour = y[pos, batch, :len(valid_indices)]
+            
+            # Vectorized edge attribute computation
+            merged_edge_attrs = torch.norm(merged_coords[merged_edges[0]] - merged_coords[merged_edges[1]], dim=1, keepdim=True)
+            merged_edge_attrs = torch.cat([merged_edge_attrs, edge_types.unsqueeze(1)], dim=1)
+            # Pre-compute undirected edge keys for all edges (reuse for s_uvi_matrix)
+            all_edge_keys = torch.stack([
+                torch.min(merged_edges.t(), dim=1)[0],
+                torch.max(merged_edges.t(), dim=1)[0]
+            ], dim=1)
+            
+            # Debug guards on merged graph tensors
+            if debug_enabled:
+                assert merged_edges.numel() == 0 or (merged_edges.min() >= 0 and merged_edges.max() < merged_coords.size(0)), "merged_edges out of bounds"
+                assert merged_edge_attrs.size(0) == merged_edges.size(1), "edge attrs length mismatch"
+                _assert_tensor_ok(merged_coords, 'merged_coords')
+                _assert_tensor_ok(merged_edge_attrs, 'merged_edge_attrs')
+                _cuda_sync_if_needed(merged_coords)
+                _cuda_sync_if_needed(merged_edge_attrs)
+            
+            # Debug: ensure dedup sizes are consistent and log memory
+            num_total_edges = merged_edges.size(1)
+            if debug_enabled:
+                assert merged_edge_attrs.size(0) == num_total_edges, "edge_attrs/edges size mismatch after dedup"
+                assert merged_edges.numel() == 0 or (merged_edges.min() >= 0 and merged_edges.max() < merged_coords.size(0)), "merged_edges OOB after dedup"
+                print(f"DEBUG: dedup num_total_edges={num_total_edges}")
+                try:
+                    free, total = torch.cuda.mem_get_info(merged_coords.device)
+                    print(f"DEBUG: CUDA mem free={free/1024/1024:.2f}MB total={total/1024/1024:.2f}MB")
+                except Exception:
+                    pass
+            
+            # Additional structural assertions (debug only)
+            if debug_enabled and num_total_edges > 0:
+                # 1) Bi-directional consistency between mappings
+                for e_idx, inst_list in edge_to_instances.items():
+                    for inst_id in inst_list:
+                        assert e_idx in instance_to_edges.get(inst_id, []), "edge_to_instances inconsistent with instance_to_edges"
+                for inst_id, e_list in instance_to_edges.items():
+                    for e_idx in e_list:
+                        assert inst_id in edge_to_instances.get(e_idx, []), "instance_to_edges inconsistent with edge_to_instances"
+                # 2) Per-instance city-city edge count diagnostic (non-fatal)
+                edge_types_cpu = edge_types.detach().cpu() if 'edge_types' in locals() else torch.zeros(num_total_edges, dtype=torch.long)
+                graph_edge_mask_global = (edge_types_cpu == 0)
+                src_nodes = merged_edges[0]
+                dst_nodes = merged_edges[1]
+                for inst_id, nodes in instance_mapping.items():
+                    if len(nodes) == 0:
+                        continue
+                    city_nodes = nodes[:-1]
+                    if len(city_nodes) == 0:
+                        continue
+                    city_node_tensor = torch.tensor(city_nodes, device=x.device, dtype=torch.long)
+                    membership = torch.zeros(merged_coords.size(0), dtype=torch.bool, device=x.device)
+                    membership[city_node_tensor] = True
+                    inst_mask = (membership[src_nodes] & membership[dst_nodes]).detach().cpu().numpy()
+                    # only graph edges (exclude center) if types present
+                    if graph_edge_mask_global.numel() == len(inst_mask):
+                        inst_graph_mask = inst_mask & graph_edge_mask_global.numpy()
+                    else:
+                        inst_graph_mask = inst_mask
+                    selected_edges = int(inst_graph_mask.sum())
+                    # expected edges for this instance from mapping
+                    mapped_edges = instance_to_edges.get(inst_id, [])
+                    mapped_graph_edges = [e for e in mapped_edges if (e < len(graph_edge_mask_global) and int(graph_edge_mask_global[e]) == 1)] if len(graph_edge_mask_global)>0 else mapped_edges
+                    expected_edges = len(mapped_graph_edges)
+                    # if selected_edges != expected_edges:
+                    #     print(f"DEBUG: Per-instance edge count differs after merge (inst {inst_id}): mask={selected_edges}, mapping={expected_edges}")
+            
+            # STEP 4: Memory-efficient s_uvi_matrix construction
+            s_uvi_matrix = torch.zeros((num_total_edges, num_instances_total), dtype=torch.float32, device=x.device)
+            # Context/target indicator matrix: 1 for context, 0 for target
+            ctx_uvi_matrix = torch.zeros((num_total_edges, num_instances_total), dtype=torch.float32, device=x.device)
+            # Instance-level context vector: 1 for context, 0 for target
+            ctx_i_vector = torch.zeros((num_instances_total,), dtype=torch.float32, device=x.device)
+             
+            # Pre-compute all tour edges for all CONTEXT instances at once (pos < eval_start_pos)
+            all_tour_edges = []
+            all_tour_instance_ids = []
+            context_instance_ids = []
+            for inst_id in range(num_instances_total):
+                pos = inst_id % seq_len
+                batch = inst_id // seq_len
+                if pos >= eval_start_pos:
+                    continue  # target instances are not used for s_uvi labels
+                city_nodes = instance_mapping.get(inst_id, [])
+                if not city_nodes:
+                    continue
+                context_instance_ids.append(inst_id)
+                if y is not None:
+                    num_nodes_inst = len(city_nodes)
+                    tour = y[pos, batch, :num_nodes_inst]
                     valid_tour_mask = (tour != -1)
                     valid_tour = tour[valid_tour_mask]
                     if len(valid_tour) > 1:
-                        # Map local node idx to global idx
-                        local_to_global = {}
-                        for local_idx, global_idx in enumerate(city_node_indices):
-                            if local_idx < len(valid_indices):
-                                local_to_global[local_idx] = global_idx
-                        # Build tour edges (有向)
+                        # local index -> global node id mapping (order aligns with valid nodes order)
+                        # city_nodes is ordered consistently with local indexing
                         curr_nodes = valid_tour
                         next_nodes = torch.cat([valid_tour[1:], valid_tour[0:1]], dim=0)
-                        for u_local, v_local in zip(curr_nodes.tolist(), next_nodes.tolist()):
-                            if u_local in local_to_global and v_local in local_to_global:
-                                u_global = local_to_global[u_local]
-                                v_global = local_to_global[v_local]
-                                # Find global edge idx
-                                edge_tensor = torch.tensor([u_global, v_global], device=x.device)
-                                # Find in unique_edges
-                                match = (unique_edges == edge_tensor).all(dim=1)
-                                idxs = torch.where(match)[0]
-                                if len(idxs) > 0:
-                                    s_uvi_matrix[idxs[0], instance_id] = 1.0
-        
-        else:
-            # OPTIMIZATION: Without coordinate merging - streamlined for speed
-            all_nodes = []
-            edge_list = []
-            edge_attr_list = []
-            instance_mapping = {}
-            node_offset_map = {}
-            eval_infos = []
+                        for u, v in zip(curr_nodes, next_nodes):
+                            u_idx = u.item()
+                            v_idx = v.item()
+                            if 0 <= u_idx < num_nodes_inst and 0 <= v_idx < num_nodes_inst:
+                                u_global = city_nodes[u_idx]
+                                v_global = city_nodes[v_idx]
+                                all_tour_edges.append([u_global, v_global])
+                                all_tour_edges.append([v_global, u_global])
+                                all_tour_instance_ids.append(inst_id)
+                                all_tour_instance_ids.append(inst_id)
+            # Mark context instances in ctx_uvi_matrix (for all edges later)
+            if context_instance_ids:
+                ctx_cols = torch.tensor(context_instance_ids, device=x.device, dtype=torch.long)
+                if ctx_cols.numel() > 0:
+                    ctx_uvi_matrix[:, ctx_cols] = 1.0
+                    ctx_i_vector[ctx_cols] = 1.0
+             
+            # Vectorized tour edge matching using searchsorted
+            if all_tour_edges:
+                 
+                tour_edges = torch.tensor(all_tour_edges, dtype=torch.long, device=x.device)  # (N,2)
+                tour_instances = torch.tensor(all_tour_instance_ids, dtype=torch.long, device=x.device)  # (N,)
+                 
+                # Create edge keys using safe multiplication
+                edge_keys_flat = merged_edges[0] * (num_nodes + 1) + merged_edges[1]
+                tour_keys = tour_edges[:,0] * (num_nodes + 1) + tour_edges[:,1]
+                 
+                # Use torch.searchsorted for fast lookup
+                sorted_keys, sorted_indices = torch.sort(edge_keys_flat)
+                tour_indices = torch.searchsorted(sorted_keys, tour_keys)
+                valid_mask = (tour_indices < len(sorted_keys)) & (sorted_keys[tour_indices] == tour_keys)
+                 
+                if valid_mask.any():
+                    row_idx = sorted_indices[tour_indices[valid_mask]]
+                    col_idx = tour_instances[valid_mask]
+                     
+                    if debug_enabled:
+                        assert row_idx.numel() == col_idx.numel(), "row/col size mismatch"
+                        assert row_idx.min() >= 0 and row_idx.max() < num_total_edges, "row_idx OOB"
+                        assert col_idx.min() >= 0 and col_idx.max() < num_instances_total, "col_idx OOB"
+                        _cuda_sync_if_needed(row_idx)
+                        _cuda_sync_if_needed(col_idx)
+                     
+                    s_uvi_matrix = torch.sparse_coo_tensor(
+                        torch.stack([row_idx, col_idx], dim=0),
+                        torch.ones(row_idx.size(0), device=x.device),
+                        (num_total_edges, num_instances_total)
+                    ).to_dense()
+                     
+                    if debug_enabled:
+                        _assert_tensor_ok(s_uvi_matrix, 's_uvi_matrix')
+                        # 3) Ensure each context instance has at least one labeled tour edge
+                        for ci in context_instance_ids:
+                            cov = int(s_uvi_matrix[:, ci].sum().item())
+                            assert cov >= 0, "invalid s_uvi coverage"
+                            if cov == 0:
+                                print(f"DEBUG: context instance {ci} has zero tour edges mapped (coverage=0)")
             
-            # ENHANCEMENT: Edge tracking for no-merge case
-            edge_to_instances = {}
-            instance_to_edges = {}
+            # 添加详细的调试信息（仅在调试模式）
+            if debug_enabled:
+                print(f"DEBUG: merged_coords shape: {merged_coords.shape if merged_coords is not None else 'None'}")
+                print(f"DEBUG: merged_edges shape: {merged_edges.shape if merged_edges is not None else 'None'}")
+                print(f"DEBUG: merged_edge_attrs shape: {merged_edge_attrs.shape if merged_edge_attrs is not None else 'None'}")
+                print(f"DEBUG: instance_mapping keys: {list(instance_mapping.keys()) if instance_mapping else 'None'}")
+                print(f"DEBUG: s_uvi_matrix shape: {s_uvi_matrix.shape if s_uvi_matrix is not None else 'None'}")
             
-            global_node_idx = 0
-            instance_id = 0
-            
-            for pos in range(seq_len):
-                for batch_idx in range(batch_size):
-                    coords = x[pos, batch_idx]
-                    valid_mask = (coords[:, 0] != -1) & (coords[:, 1] != -1)
-                    num_valid_nodes = len(valid_indices := torch.where(valid_mask)[0])
-                    
-                    if num_valid_nodes == 0:
-                        continue
-                    
-                    valid_coords = coords[valid_mask]
-                    
-                    # Add nodes efficiently
-                    city_node_indices = list(range(global_node_idx, global_node_idx + num_valid_nodes))
-                    all_nodes.append(valid_coords)
-                    
-                    center_coord = valid_coords.mean(dim=0)
-                    center_node_idx = global_node_idx + num_valid_nodes
-                    all_nodes.append(center_coord.unsqueeze(0))
-                    
-                    instance_mapping[instance_id] = city_node_indices + [center_node_idx]
-                    
-                    # Initialize instance edge tracking
-                    instance_to_edges[instance_id] = []
-                    
-                    # OPTIMIZATION: Fast node offset mapping
-                    for j, valid_idx in enumerate(valid_indices):
-                        node_offset_map[(pos, batch_idx, valid_idx.item())] = global_node_idx + j
-                    
-                    # OPTIMIZATION: Fast edge building with tracking
-                    graph_edges, graph_distances = self._build_graph_edges(
-                        valid_coords, num_valid_nodes, candidate_info, pos, batch_idx, batch_size, x.device
+            if merged_coords.size(0) > 0 and merged_edges.size(1) > 0:
+                try:
+                    if debug_enabled:
+                        _cuda_sync_if_needed(merged_coords)
+                        _cuda_sync_if_needed(merged_edges)
+                        _cuda_sync_if_needed(merged_edge_attrs)
+                    node_embs, edge_embs, z_instances, all_predictions = self.net.infer(
+                        x=merged_coords,
+                        edge_index=merged_edges,
+                        edge_attr=merged_edge_attrs,
+                        batch=torch.zeros(merged_coords.size(0), device=x.device, dtype=torch.long),
+                        emb_net=self.net.emb_net,
+                        use_instance_hypergraph=True,
+                        instance_mapping=instance_mapping,
+                        s_uvi_matrix=s_uvi_matrix,
+                        ctx_uvi_matrix=ctx_uvi_matrix,
+                        ctx_i_vector=ctx_i_vector,
+                        single_eval_pos=single_eval_pos,
+                        instance_to_edges=instance_to_edges,
+                        edge_to_instances=edge_to_instances
                     )
+                    if debug_enabled:
+                        print("DEBUG: GNN finished")
                     
-                    if graph_edges.size(1) > 0:
-                        global_graph_edges = graph_edges + global_node_idx
-                        edge_list.append(global_graph_edges)
-                        
-                        # Track graph edges for this instance
-                        for edge_idx in range(global_graph_edges.size(1)):
-                            edge_u, edge_v = global_graph_edges[0, edge_idx].item(), global_graph_edges[1, edge_idx].item()
-                            edge_key = (min(edge_u, edge_v), max(edge_u, edge_v))
-                            edge_to_instances[edge_key] = [instance_id]
-                            instance_to_edges[instance_id].append(edge_key)
-                        
-                        # OPTIMIZATION: Vectorized edge attributes
-                        num_graph_edges = graph_edges.size(1)
-                        graph_edge_attrs = torch.zeros((num_graph_edges, 2), device=x.device)
-                        graph_edge_attrs[:, 0] = graph_distances.squeeze(-1)
-                        graph_edge_attrs[:, 1] = 0.0
-                        edge_attr_list.append(graph_edge_attrs)
-                    
-                    # OPTIMIZATION: Fast center edges with tracking
-                    if num_valid_nodes > 0:
-                        city_indices = torch.arange(global_node_idx, global_node_idx + num_valid_nodes, device=x.device)
-                        center_indices = torch.full_like(city_indices, center_node_idx)
-                        
-                        forward_edges = torch.stack([city_indices, center_indices], dim=0)
-                        backward_edges = torch.stack([center_indices, city_indices], dim=0)
-                        center_edges = torch.cat([forward_edges, backward_edges], dim=1)
-                        
-                        edge_list.append(center_edges)
-                        
-                        # Track center edges for this instance
-                        for edge_idx in range(center_edges.size(1)):
-                            edge_u, edge_v = center_edges[0, edge_idx].item(), center_edges[1, edge_idx].item()
-                            edge_key = (min(edge_u, edge_v), max(edge_u, edge_v))
-                            edge_to_instances[edge_key] = [instance_id]
-                            instance_to_edges[instance_id].append(edge_key)
-                        
-                        num_center_edges = center_edges.size(1)
-                        center_edge_attrs = torch.zeros((num_center_edges, 2), device=x.device)
-                        center_edge_attrs[:, 0] = 0.0
-                        center_edge_attrs[:, 1] = 1.0
-                        edge_attr_list.append(center_edge_attrs)
-                    
-                    # Store evaluation info
-                    if pos >= eval_start_pos:
-                        eval_infos.append({
-                            'pos': pos,
-                            'batch': batch_idx,
-                            'instance_id': instance_id,
-                            'num_valid_nodes': num_valid_nodes,
-                            'valid_indices': valid_indices,
-                            'node_offset_map': {k: v for k, v in node_offset_map.items() 
-                                              if k[0] == pos and k[1] == batch_idx},
-                            'city_node_indices': city_node_indices,
-                            'center_node_idx': center_node_idx
-                        })
-                    
-                    global_node_idx += num_valid_nodes + 1
-                    instance_id += 1
+                    # 添加GNN推理后的调试信息（仅在调试模式）
+                    if debug_enabled:
+                        print(f"DEBUG: all_predictions shape: {all_predictions.shape if all_predictions is not None else 'None'}")
+                        print(f"DEBUG: all_predictions device: {all_predictions.device if all_predictions is not None else 'None'}")
+                        print(f"DEBUG: all_predictions dtype: {all_predictions.dtype if all_predictions is not None else 'None'}")
+                        if all_predictions is not None:
+                            _assert_tensor_ok(all_predictions, 'all_predictions')
+                            _cuda_sync_if_needed(all_predictions)
+                            # 忽略0.0（padding）求min/max
+                            nz_mask = all_predictions != 0
+                            if nz_mask.any():
+                                nz_vals = all_predictions[nz_mask]
+                                print(f"DEBUG: all_predictions min/max (non-zero): {nz_vals.min().item():.6f}/{nz_vals.max().item():.6f}")
+                            else:
+                                print("DEBUG: all_predictions non-zero min/max: <no non-zero values>")
+                            print(f"DEBUG: all_predictions has nan: {torch.isnan(all_predictions).any().item()}")
+                            print(f"DEBUG: all_predictions has inf: {torch.isinf(all_predictions).any().item()}")
+                 
+                except Exception as e:
+                    if debug_enabled:
+                        print(f"DEBUG: GNN推理失败: {e}")
+                        print(f"DEBUG: 异常类型: {type(e)}")
+                        import traceback
+                        traceback.print_exc()
+                     # 初始化空变量
+                    node_embs = torch.zeros(seq_len, batch_size, self.emsize, device=x.device)
+                    edge_embs = None
+                    z_instances = {}
+                    all_predictions = None
             
-            merged_coords = torch.cat(all_nodes, dim=0) if all_nodes else torch.empty((0, 2), device=x.device)
-        
-            # Single concatenation at the end
-            if edge_list:
-                merged_edges = torch.cat(edge_list, dim=1)
-                merged_edge_attrs = torch.cat(edge_attr_list, dim=0)
             else:
-                merged_edges = torch.empty((2, 0), dtype=torch.long, device=x.device)
-                merged_edge_attrs = torch.empty((0, 2), device=x.device)
-        
-        time_b = time.time()
-        if merged_coords.size(0) > 0 and merged_edges.size(1) > 0:
-            node_embs, edge_embs, z_instances, all_predictions = self.net.infer(
-                x=merged_coords,
-                edge_index=merged_edges,
-                edge_attr=merged_edge_attrs,
-                batch=torch.zeros(merged_coords.size(0), device=x.device, dtype=torch.long),
-                emb_net=self.net.emb_net,
-                use_instance_hypergraph=True,
-                instance_mapping=instance_mapping,
-                s_uvi_matrix=s_uvi_matrix,
-                single_eval_pos=single_eval_pos,
-                instance_to_edges=instance_to_edges,
-                edge_to_instances=edge_to_instances
-            )
-        else:
-            node_embs = torch.zeros(seq_len, batch_size, self.emsize, device=x.device)
-            edge_embs = None
-            z_instances = {}
-            all_predictions = torch.empty(0, device=x.device)
+                if debug_enabled:
+                    print("DEBUG: 跳过GNN推理 - 没有有效的坐标或边")
+                 # 初始化空变量
+                node_embs = torch.zeros(seq_len, batch_size, self.emsize, device=x.device)
+                edge_embs = None
+                z_instances = {}
+                all_predictions = None
         
         # OPTIMIZATION: Fast edge filtering and prediction generation
         predictions_list = []
         edge_counts = []
         
+        if debug_enabled:
+            print(f"DEBUG: post processing, eval_infos count: {len(eval_infos)}")
+            print(f"DEBUG: merged_edges shape: {merged_edges.shape if merged_edges is not None else 'None'}")
+        
         if len(eval_infos) > 0 and merged_edges.size(1) > 0:
-            # OPTIMIZATION: Vectorized edge filtering
-            src_nodes = merged_edges[0]
-            dst_nodes = merged_edges[1]
-            
-            for eval_info in eval_infos:
-                instance_id = eval_info['instance_id']
-                city_node_indices = eval_info['city_node_indices']
-                
-                if len(city_node_indices) > 0:
-                    # OPTIMIZATION: Efficient edge masking using isin
-                    city_node_tensor = torch.tensor(city_node_indices, device=x.device, dtype=torch.long)
-                    src_in_city = torch.isin(src_nodes, city_node_tensor)
-                    dst_in_city = torch.isin(dst_nodes, city_node_tensor)
-                    instance_edge_mask = src_in_city & dst_in_city
-                    instance_edges = merged_edges[:, instance_edge_mask]
-                    
-                    # Fix: Extract predictions for this specific instance
-                    if instance_edge_mask.any():
-                        instance_preds = all_predictions[instance_edge_mask, instance_id]  # [num_edges_for_instance]
-                    else:
-                        instance_preds = torch.empty(0, device=x.device)
-                    
-                    predictions_list.append(instance_preds)
-                    edge_counts.append(instance_edges.size(1))
-                    eval_info['edge_index'] = instance_edges
-                else:
+            # Mapping-based edge selection (faster and correct across merged instances)
+            for eval_idx, eval_info in enumerate(eval_infos):
+                correct_instance_id = eval_info.get('instance_id', None)
+                if correct_instance_id is None:
                     predictions_list.append(torch.empty(0, device=x.device))
                     edge_counts.append(0)
                     eval_info['edge_index'] = torch.empty((2, 0), dtype=torch.long, device=x.device)
-        else:
-            for eval_info in eval_infos:
-                predictions_list.append(torch.empty(0, device=x.device))
-                edge_counts.append(0)
-                eval_info['edge_index'] = torch.empty((2, 0), dtype=torch.long, device=x.device)
+                    eval_info['correct_instance_id'] = None
+                    continue
+                mapped_edges = instance_to_edges.get(correct_instance_id, [])
+                if len(mapped_edges) == 0:
+                    predictions_list.append(torch.empty(0, device=x.device))
+                    edge_counts.append(0)
+                    eval_info['edge_index'] = torch.empty((2, 0), dtype=torch.long, device=x.device)
+                    eval_info['correct_instance_id'] = correct_instance_id
+                    continue
+                edge_ids_tensor = torch.tensor(mapped_edges, device=x.device, dtype=torch.long)
+                # Optionally filter to city-city graph edges (edge_type==0) if types exist
+                if 'edge_types' in locals() and edge_types.numel() == merged_edges.size(1):
+                    graph_mask_ids = (edge_types[edge_ids_tensor] == 0)
+                    if graph_mask_ids.any():
+                        edge_ids_tensor = edge_ids_tensor[graph_mask_ids]
+                    else:
+                        edge_ids_tensor = edge_ids_tensor[:0]
+                if edge_ids_tensor.numel() > 0:
+                    instance_edges = merged_edges[:, edge_ids_tensor]
+                    if all_predictions is not None:
+                        instance_preds = all_predictions[edge_ids_tensor, correct_instance_id]
+                    else:
+                        instance_preds = torch.empty(0, device=x.device)
+                else:
+                    instance_edges = torch.empty((2, 0), dtype=torch.long, device=x.device)
+                    instance_preds = torch.empty(0, device=x.device)
+                predictions_list.append(instance_preds)
+                edge_counts.append(instance_edges.size(1))
+                eval_info['edge_index'] = instance_edges
+                eval_info['correct_instance_id'] = correct_instance_id
+                if debug_enabled:
+                    assert instance_preds.numel() == instance_edges.size(1), "prediction count != edge_index size for instance"
         
         # OPTIMIZATION: Fast output tensor creation
         seq_eval_len = seq_len - eval_start_pos
         max_edges = max(edge_counts) if edge_counts else 1
-        edge_values_padded = torch.zeros(seq_eval_len, batch_size, max_edges, device=x.device)
-        
-        # OPTIMIZATION: Vectorized prediction filling
+        # Build padded predictions via pad-and-stack to preserve autograd graph
+        rows = []
         pred_idx = 0
         for pos in range(eval_start_pos, seq_len):
+            batch_rows = []
             for batch_idx in range(batch_size):
                 if pred_idx < len(predictions_list):
-                    pred_size = predictions_list[pred_idx].size(0)
-                    if pred_size > 0:
-                        edge_values_padded[pos - eval_start_pos, batch_idx, :pred_size] = predictions_list[pred_idx]
+                    preds = predictions_list[pred_idx]
                     pred_idx += 1
+                else:
+                    preds = torch.empty(0, device=x.device)
+                pad_len = max_edges - preds.size(0)
+                padded = F.pad(preds, (0, pad_len)) if pad_len > 0 else preds
+                batch_rows.append(padded.unsqueeze(0))  # [1, max_edges]
+            rows.append(torch.cat(batch_rows, dim=0).unsqueeze(0))  # [1, B, max_edges]
+        edge_values_padded = torch.cat(rows, dim=0) if rows else torch.zeros(seq_eval_len, batch_size, max_edges, device=x.device)
         
         edge_info = {
             'embeddings': edge_embs,
@@ -1531,7 +1705,9 @@ class TSPGraphEncoder(nn.Module):
             'global_to_originals': global_to_originals if self.merge_duplicate_coords else {},
             'edge_to_instances': edge_to_instances,  
             'instance_to_edges': instance_to_edges,  
-            's_uvi_matrix': s_uvi_matrix  # [num_edges, num_instances]
+            's_uvi_matrix': s_uvi_matrix,  # [num_edges, num_instances]
+            'ctx_uvi_matrix': ctx_uvi_matrix,
+            'ctx_i_vector': ctx_i_vector
         }
         
         final_output = {

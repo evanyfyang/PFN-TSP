@@ -130,10 +130,13 @@ class TSPOfflineDataLoader(PriorDataLoader):
         else:
             # Original logic for other strategies
             total_instances = sum(len(instances) for instances in self.dataset.values())
-        # Each step processes seq_len_maximum * batch_size instances
-        instances_per_step = self.seq_len_maximum * self.batch_size
-        steps = max(1, total_instances // instances_per_step)
-        return steps
+            for num_nodes, instances in self.dataset.items():
+                num_groups = instances[-1]['group_id'] + 1
+                break
+            total_groups = num_groups * len(self.dataset)
+            groups_per_step = self.seq_len_maximum * self.batch_size
+            steps = max(1, total_instances // groups_per_step)
+            return steps
     
     def __len__(self):
         return self.num_steps
@@ -254,11 +257,14 @@ class TSPOfflineDataLoader(PriorDataLoader):
             # Create group pools for each node count
             group_pools = {}
             for num_nodes, instances in self.dataset.items():
-                num_groups = len(instances) // (self.seq_len_maximum * self.batch_size)
-                groups = [instances[i:i + self.seq_len_maximum * self.batch_size] 
-                         for i in range(0, len(instances), self.seq_len_maximum * self.batch_size)]
+                num_groups = instances[-1]['group_id'] + 1
+                group_instances_per_group = len(instances) // num_groups
+                # num_groups = len(instances) // (self.seq_len_maximum * self.batch_size)
+                groups = [instances[i:i + group_instances_per_group] 
+                         for i in range(0, len(instances), group_instances_per_group)]
                 if self.shuffle:
-                    random.shuffle(groups) 
+                    for group in groups:
+                        random.shuffle(group)
                 group_pools[num_nodes] = groups
             
             # Track current group in each pool
@@ -267,13 +273,11 @@ class TSPOfflineDataLoader(PriorDataLoader):
             for step in range(self.num_steps):
                 # Randomly select a node count for this batch
                 available_nodes = [num_nodes for num_nodes, pos in group_positions.items() 
-                                 if pos < len(group_pools[num_nodes])]
+                                 if pos + self.batch_size < len(group_pools[num_nodes])]
                 
                 if not available_nodes:
                     # Reset pools if all are exhausted
                     for num_nodes in group_pools.keys():
-                        if self.shuffle:
-                            random.shuffle(group_pools[num_nodes])
                         group_positions[num_nodes] = 0
                     available_nodes = list(group_pools.keys())
                 
@@ -281,11 +285,11 @@ class TSPOfflineDataLoader(PriorDataLoader):
                 
                 # Get group for this batch
                 groups = group_pools[current_num_nodes]
-                current_group = groups[group_positions[current_num_nodes]]
-                group_positions[current_num_nodes] += 1
+                step_groups = groups[group_positions[current_num_nodes]:group_positions[current_num_nodes] + self.batch_size]
+                group_positions[current_num_nodes] += self.batch_size
                 
                 # Create batch tensors
-                x, y, candidate_info = self._create_batch_from_instances(current_group, current_num_nodes)
+                x, y, candidate_info = self._create_batch_from_groups(step_groups, current_num_nodes)
                 
                 # Sample evaluation position
                 single_eval_pos, _ = self.eval_pos_seq_len_sampler()
@@ -492,6 +496,67 @@ class TSPOfflineDataLoader(PriorDataLoader):
             
             # Add candidate info
             candidate_info_flat.append(instance['candidate_info'])
+        
+        # Print debug information for the first batch
+        if not self._first_batch_generated:
+            self._first_batch_generated = True
+            print(f"\n=== First Batch Debug Info (Offline) ===")
+            print(f"x tensor shape: {x.shape}")
+            print(f"y tensor shape: {y.shape}")
+            print(f"Maximum nodes in batch: {max_nodes}")
+            print(f"Using -1 as padding value for both coordinates and tours")
+            
+            # Calculate average number of edges from candidate info
+            if candidate_info_flat:
+                total_edges = 0
+                valid_instances = 0
+                
+                for candidate_info in candidate_info_flat:
+                    if candidate_info and 'candidates' in candidate_info:
+                        instance_edges = 0
+                        for node_id, candidates in candidate_info['candidates'].items():
+                            instance_edges += len(candidates)
+                        total_edges += instance_edges
+                        valid_instances += 1
+                
+                if valid_instances > 0:
+                    avg_edges = total_edges / valid_instances
+                    print(f"Average edges per graph (from LKH3 candidates): {avg_edges:.1f}")
+                    print(f"Total instances with candidate info: {valid_instances}")
+                else:
+                    print("No valid candidate information found")
+            else:
+                print("No candidate information available")
+            
+            print(f"Batch size: {self.batch_size}")
+            print(f"Sequence length (num_graphs): {self.seq_len_maximum}")
+            print(f"Total TSP instances in this batch: {self.seq_len_maximum * self.batch_size}")
+            print("=" * 30 + "\n")
+        
+        return x, y, candidate_info_flat 
+    
+    def _create_batch_from_groups(self, groups: List[Dict], num_nodes: int):
+        """Create batch tensors from instance list"""
+        max_nodes = max(len(group[0]['coords']) for group in groups)
+        x = torch.full((self.seq_len_maximum, self.batch_size, max_nodes, 2), -1.0, dtype=torch.float32)
+        y = torch.full((self.seq_len_maximum, self.batch_size, max_nodes), -1, dtype=torch.long)
+        
+        candidate_info_flat = []
+        
+        # Fill tensors
+        for i, group in enumerate(groups):
+            for j, instance in enumerate(group):
+                # Get instance coordinates - no padding needed, just place in tensor
+                coords = instance['coords']
+                num_actual_nodes = len(coords)
+                x[j, i, :num_actual_nodes] = torch.tensor(coords, dtype=torch.float32)
+            
+                # Get instance tour - no padding needed, just place in tensor
+                tour = instance['tour']
+                y[j, i, :num_actual_nodes] = torch.tensor(tour, dtype=torch.long)
+                
+                # Add candidate info
+                candidate_info_flat.append(instance['candidate_info'])
         
         # Print debug information for the first batch
         if not self._first_batch_generated:

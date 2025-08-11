@@ -219,10 +219,6 @@ class TransformerModel(nn.Module):
         # Pass candidate_info and y_src to encoder if it supports them
         if hasattr(self.encoder, 'forward') and 'candidate_info' in self.encoder.forward.__code__.co_varnames:
             encoder_kwargs = {'candidate_info': candidate_info}
-            
-            # Add y parameter if encoder supports unified encoding
-            if encoder_supports_unified and 'y' in self.encoder.forward.__code__.co_varnames:
-                encoder_kwargs['y'] = y_src
                 
             if 'gat_pooling' in self.encoder.forward.__code__.co_varnames:
                 encoder_kwargs['gat_pooling'] = self.gat_pooling
@@ -231,7 +227,7 @@ class TransformerModel(nn.Module):
             if 'single_eval_pos' in self.encoder.forward.__code__.co_varnames:
                 encoder_kwargs['single_eval_pos'] = single_eval_pos
                 
-            x_encoder_output = self.encoder(x_src, **encoder_kwargs)
+            x_encoder_output = self.encoder(x_src, y_src,**encoder_kwargs)
         else:
             x_encoder_output = self.encoder(x_src)
 

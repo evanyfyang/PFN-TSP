@@ -23,7 +23,7 @@ MERGE_DUPLICATE_COORDS=true
 LOSS_DIRECTION_MODE="both"  # Control loss calculation direction (bidirectional edges always created)
 EDGE_TYPE_MODE="triple"  # Edge type mode for no-merge SharedBasisFiLM: single or triple
 PREDICTION_MODE="mlp_concat"  # Prediction mode: 'dot_product' or 'mlp_concat'
-USE_RESIDUAL_NORM=false  # Use residual connections and LayerNorm
+USE_RESIDUAL_NORM=true  # Use residual connections and LayerNorm
 
 # Show help information
 show_help() {
@@ -33,7 +33,7 @@ show_help() {
     echo "  -s, --min_nodes NUM   Minimum number of nodes (default: 31)"
     echo "  -l, --max_nodes NUM   Maximum number of nodes (default: 80)"
     echo "  -g, --gpu ID          GPU ID (default: 0)"
-    echo "  -c, --candidates NUM  Max candidates per node for LKH3 (default: 5)"
+    echo "  -c, --candidates NUM  Max candidates per node for graph construction (default: 5, LKH3 uses fixed 5)"
     echo "  -e, --epochs NUM      Number of training epochs (default: 20)"
     echo "  -b, --batch_size NUM  Batch size (default: 32)"
     echo "  --emsize NUM          Embedding size (default: 128)"
@@ -220,7 +220,7 @@ echo "Starting TSP offline training..."
 echo "Dataset: $DATASET_PATH"
 echo "Node range: $MIN_NODES-$MAX_NODES"
 echo "GPU: $GPU"
-echo "Max candidates: $MAX_CANDIDATES"
+echo "Graph max candidates: $MAX_CANDIDATES (LKH3 uses fixed 5)"
 echo "Epochs: $EPOCHS"
 echo "Batch size: $BATCH_SIZE"
 echo "Model config: emsize=$EMSIZE, nhid=$NHID, nlayers=$NLAYERS, nhead=$NHEAD"
@@ -238,10 +238,20 @@ echo ""
 
 export CUDA_VISIBLE_DEVICES=$GPU
 export TORCH_CUDNN_BENCHMARK=True
-export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:64,garbage_collection_threshold:0.8
+export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:64,garbage_collection_threshold:0.8,expandable_segments:True
 export TORCH_CUDNN_ALLOW_TF32=1
 export OMP_NUM_THREADS=4
 export TORCH_COMPILE_MODE=reduce-overhead
+# Debugging/diagnostics (safe to keep enabled; may slow down execution)
+export TSP_DEBUG_GUARDS=${TSP_DEBUG_GUARDS:-0}
+if [ -n "$TORCH_SHOW_CPP_STACKTRACES" ]; then export TORCH_SHOW_CPP_STACKTRACES=$TORCH_SHOW_CPP_STACKTRACES; fi
+if [ -n "$CUDA_LAUNCH_BLOCKING" ]; then export CUDA_LAUNCH_BLOCKING=$CUDA_LAUNCH_BLOCKING; fi
+if [ -n "$TORCH_USE_CUDA_DSA" ]; then export TORCH_USE_CUDA_DSA=$TORCH_USE_CUDA_DSA; fi
+export TSP_AGGREGATION_MODE=${TSP_AGGREGATION_MODE:-instance_first}
+export TSP_SHARE_FILM=${TSP_SHARE_FILM:-1}
+export TSP_ENABLE_FILM=${TSP_ENABLE_FILM:-1}
+export TSP_STEP1_USE_Z=${TSP_STEP1_USE_Z:-1}
+export TSP_PER_INSTANCE_EMBNET=${TSP_PER_INSTANCE_EMBNET:-0}
 
 TRAIN_CMD="python scripts/train_and_evaluate_tsp.py \
     --training_mode offline \

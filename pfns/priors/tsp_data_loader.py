@@ -178,7 +178,7 @@ class TSPDataLoader(PriorDataLoader):
     def __init__(self, num_steps: int, batch_size: int, eval_pos_seq_len_sampler: callable, 
                  seq_len_maximum: int, device: str, num_nodes_range: tuple = (10, 10),
                  num_processes: int = 16, include_ortools: bool = False, 
-                 use_lkh3: bool = True, max_candidates: int = 15, alpha: float = None, **kwargs):
+                 use_lkh3: bool = True, graph_max_candidates: int = 15, alpha: float = None, **kwargs):
         """
         Parameters:
             num_steps: Number of iterations per epoch.
@@ -190,7 +190,7 @@ class TSPDataLoader(PriorDataLoader):
             num_processes: Number of processes to use for parallel TSP solving. If None, uses number of CPU cores.
             include_ortools: Whether to include solutions computed using OR-Tools in the batches.
             use_lkh3: Whether to use LKH3 solver instead of elkai for generating candidate sets.
-            max_candidates: Maximum number of candidates per node for LKH3.
+            graph_max_candidates: Maximum number of candidates per node for graph construction (used in TSPGraphEncoder).
             alpha: Alpha value for LKH3 candidate generation (optional, uses LKH3 default if None).
             **kwargs: Additional keyword arguments.
         """
@@ -202,7 +202,10 @@ class TSPDataLoader(PriorDataLoader):
         self.num_nodes_range = num_nodes_range
         self.include_ortools = include_ortools
         self.use_lkh3 = use_lkh3
-        self.max_candidates = max_candidates
+        # LKH3 max_candidates is fixed to 5 for consistent data generation
+        self.lkh3_max_candidates = 5
+        # graph_max_candidates is used for graph construction in TSPGraphEncoder
+        self.graph_max_candidates = graph_max_candidates
         self.alpha = alpha
         
         # Add flag to track first batch generation
@@ -214,9 +217,10 @@ class TSPDataLoader(PriorDataLoader):
         
         if self.use_lkh3:
             if self.alpha is not None:
-                print(f"Using LKH3 solver with max_candidates={self.max_candidates}, alpha={self.alpha}")
+                print(f"Using LKH3 solver with fixed max_candidates=5, alpha={self.alpha}")
             else:
-                print(f"Using LKH3 solver with max_candidates={self.max_candidates}, alpha=LKH3_default")
+                print(f"Using LKH3 solver with fixed max_candidates=5, alpha=LKH3_default")
+            print(f"Graph construction will use max_candidates={self.graph_max_candidates}")
         else:
             print("Using elkai solver")
         
@@ -306,7 +310,7 @@ class TSPDataLoader(PriorDataLoader):
     def _solve_tsp_lkh3_parallel(self, coords_list):
         """Solve multiple TSP instances in parallel using LKH3"""
         # Prepare arguments for parallel processing
-        args_list = [(coords, self.max_candidates, self.alpha) for coords in coords_list]
+        args_list = [(coords, self.lkh3_max_candidates, self.alpha) for coords in coords_list]
         
         with mp.Pool(processes=self.num_processes) as pool:
             results = pool.map(solve_tsp_lkh3_parallel_worker, args_list)

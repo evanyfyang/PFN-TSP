@@ -317,7 +317,8 @@ def generate_group_fixed_nodes_worker(args):
     np.random.seed(group_seed)
     
     # Generate fixed nodes for this group
-    fixed_nodes = max(min_fixed_nodes, num_nodes + 10)  # Ensure fixed_nodes >= num_nodes
+    # Use max(current_nodes + 10, current_nodes * 1.4) for better node pool size
+    fixed_nodes = max(num_nodes + 10, int(num_nodes * 1.4))
     fixed_coords = np.random.uniform(0, 1, size=(fixed_nodes, 2))
     
     # Generate instances serially within this worker (no nested multiprocessing)
@@ -396,8 +397,10 @@ def generate_tsp_instances_with_group_fixed_nodes(min_nodes, max_nodes, num_inst
     
     num_groups = num_instances // instances_per_group
     
+    # Note: min_fixed_nodes is not actually used in the worker function
+    # The worker function calculates fixed_nodes directly based on num_nodes
     if min_fixed_nodes is None:
-        min_fixed_nodes = max(instances_per_group + 10, max_nodes)
+        min_fixed_nodes = 0  # Not used, but kept for compatibility
     
     print(f"Generating TSP instances with group fixed nodes using {num_processes} processes...")
     print(f"Node range: {min_nodes}-{max_nodes}, Groups per node size: {num_groups}, Instances per group: {instances_per_group}")
@@ -497,8 +500,10 @@ def generate_test_instances_with_group_fixed_nodes(min_nodes, max_nodes, test_in
     
     num_groups = test_instances // instances_per_group
     
+    # Note: min_fixed_nodes is not actually used in the worker function
+    # The worker function calculates fixed_nodes directly based on num_nodes
     if min_fixed_nodes is None:
-        min_fixed_nodes = max(instances_per_group + 10, max_nodes)
+        min_fixed_nodes = 0  # Not used, but kept for compatibility
     
     # Generate instances for each node count
     all_instances = {}
