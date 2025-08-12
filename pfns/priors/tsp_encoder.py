@@ -1660,9 +1660,23 @@ class TSPGraphEncoder(nn.Module):
                         instance_preds = all_predictions[edge_ids_tensor, correct_instance_id]
                     else:
                         instance_preds = torch.empty(0, device=x.device)
+                    # Debug assertions: verify edges belong to the correct instance and endpoints are within its city nodes
+                    if debug_enabled:
+                        # 1) mapping consistency: each edge_id must include correct_instance_id
+                        for e_id in edge_ids_tensor.detach().cpu().tolist():
+                            assert correct_instance_id in edge_to_instances.get(e_id, []), "edge selected not mapped to correct instance"
+                        # 2) endpoints are within this instance's city nodes (exclude center)
+                        inst_nodes = instance_mapping.get(correct_instance_id, [])
+                        city_nodes = inst_nodes[:-1] if len(inst_nodes) > 0 else []
+                        if len(city_nodes) > 0:
+                            city_set = set(int(n) for n in city_nodes)
+                            src_e = instance_edges[0].detach().cpu().tolist()
+                            dst_e = instance_edges[1].detach().cpu().tolist()
+                            for u_g, v_g in zip(src_e, dst_e):
+                                assert (u_g in city_set) and (v_g in city_set), "edge endpoint not in instance city nodes"
                 else:
-                    instance_edges = torch.empty((2, 0), dtype=torch.long, device=x.device)
-                    instance_preds = torch.empty(0, device=x.device)
+                     instance_edges = torch.empty((2, 0), dtype=torch.long, device=x.device)
+                     instance_preds = torch.empty(0, device=x.device)
                 predictions_list.append(instance_preds)
                 edge_counts.append(instance_edges.size(1))
                 eval_info['edge_index'] = instance_edges

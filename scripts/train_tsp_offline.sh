@@ -243,7 +243,7 @@ export TORCH_CUDNN_ALLOW_TF32=1
 export OMP_NUM_THREADS=4
 export TORCH_COMPILE_MODE=reduce-overhead
 # Debugging/diagnostics (safe to keep enabled; may slow down execution)
-export TSP_DEBUG_GUARDS=${TSP_DEBUG_GUARDS:-0}
+export TSP_DEBUG_GUARDS=${TSP_DEBUG_GUARDS:-1}
 if [ -n "$TORCH_SHOW_CPP_STACKTRACES" ]; then export TORCH_SHOW_CPP_STACKTRACES=$TORCH_SHOW_CPP_STACKTRACES; fi
 if [ -n "$CUDA_LAUNCH_BLOCKING" ]; then export CUDA_LAUNCH_BLOCKING=$CUDA_LAUNCH_BLOCKING; fi
 if [ -n "$TORCH_USE_CUDA_DSA" ]; then export TORCH_USE_CUDA_DSA=$TORCH_USE_CUDA_DSA; fi
@@ -251,7 +251,8 @@ export TSP_AGGREGATION_MODE=${TSP_AGGREGATION_MODE:-instance_first}
 export TSP_SHARE_FILM=${TSP_SHARE_FILM:-1}
 export TSP_ENABLE_FILM=${TSP_ENABLE_FILM:-1}
 export TSP_STEP1_USE_Z=${TSP_STEP1_USE_Z:-1}
-export TSP_PER_INSTANCE_EMBNET=${TSP_PER_INSTANCE_EMBNET:-0}
+export TSP_PER_INSTANCE_EMBNET=${TSP_PER_INSTANCE_EMBNET:-1}
+export TSP_USE_NODE_SOFTMAX_LOSS=${TSP_USE_NODE_SOFTMAX_LOSS:-1}
 
 TRAIN_CMD="python scripts/train_and_evaluate_tsp.py \
     --training_mode offline \

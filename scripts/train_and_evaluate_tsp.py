@@ -398,6 +398,92 @@ def predict_tsp_with_pfn(model, coords, solution, candidate_info=None, use_compl
             adj_list[u_node].append((v_node, avg_prob))
             adj_list[v_node].append((u_node, avg_prob))
         
+        # ---------------------------------------------------------------------
+        # Data contracts (all indices are local node ids in [0, N)):
+        # - node_positions: np.ndarray, shape (N, 2), dtype=float32
+        #       Local coordinates of the last (target) instance.
+        # - distance_matrix: np.ndarray, shape (N, N), dtype=float32
+        #       Full pairwise Euclidean distances between local nodes.
+        # - candidate_mask: np.ndarray, shape (N, N), dtype=bool
+        #       True if edge (u, v) exists in candidate graph for the target instance.
+        # - prob_matrix: np.ndarray, shape (N, N), dtype=float32 in [0, 1]
+        #       Edge prior probabilities for the target instance. Symmetric undirected
+        #       prior (averaged over both directions when available).
+        # - neighbor_lists: List[List[Tuple[int, float]]]
+        #       For each node u, a list of (v, prob) sorted by prob descending.
+        # - undirected_edges: np.ndarray, shape (E_u, 2), dtype=int64 with u < v
+        #       Unique undirected candidate edges for the target instance.
+        # - undirected_edge_probs: np.ndarray, shape (E_u,), dtype=float32
+        #       Probability per undirected edge (mean of both directions when available).
+        # - undirected_edge_lengths: np.ndarray, shape (E_u,), dtype=float32
+        #       Euclidean length per undirected edge, aligned with undirected_edges.
+        # ---------------------------------------------------------------------
+        try:
+            # Local node positions (N, 2)
+            node_positions = np.asarray(last_coords, dtype=np.float32)
+            N_local = node_positions.shape[0]
+            
+            # Distance matrix (N, N)
+            if N_local > 0:
+                diffs = node_positions[:, None, :] - node_positions[None, :, :]
+                distance_matrix = np.linalg.norm(diffs, axis=-1).astype(np.float32)
+            else:
+                distance_matrix = np.zeros((0, 0), dtype=np.float32)
+            
+            # Build candidate mask and initial (directed) prob matrix from adj_list
+            prob_matrix = np.zeros((N_local, N_local), dtype=np.float32)
+            candidate_mask = np.zeros((N_local, N_local), dtype=bool)
+            for u in range(N_local):
+                for v, p in (adj_list[u] if u < len(adj_list) else []):
+                    if 0 <= v < N_local and u != v:
+                        candidate_mask[u, v] = True
+                        # Use max in case multiple sources write to the same directed entry
+                        prob_matrix[u, v] = max(prob_matrix[u, v], float(p))
+            
+            # Aggregate to undirected edges and symmetrize prob_matrix
+            undirected_acc = {}
+            for u in range(N_local):
+                for v, p in (adj_list[u] if u < len(adj_list) else []):
+                    if 0 <= v < N_local and u != v:
+                        a, b = (u, v) if u < v else (v, u)
+                        undirected_acc.setdefault((a, b), []).append(float(p))
+            
+            undirected_edges = []
+            undirected_edge_probs = []
+            undirected_edge_lengths = []
+            for (a, b), ws in undirected_acc.items():
+                # Mean of both directions when both are present
+                p = float(np.mean(ws)) if len(ws) > 0 else 0.0
+                undirected_edges.append((a, b))
+                undirected_edge_probs.append(p)
+                undirected_edge_lengths.append(distance_matrix[a, b] if a < N_local and b < N_local else 0.0)
+                # Symmetric prior for decoding
+                prob_matrix[a, b] = p
+                prob_matrix[b, a] = p
+                candidate_mask[a, b] = True
+                candidate_mask[b, a] = True
+            
+            undirected_edges = np.asarray(undirected_edges, dtype=np.int64)
+            undirected_edge_probs = np.asarray(undirected_edge_probs, dtype=np.float32)
+            undirected_edge_lengths = np.asarray(undirected_edge_lengths, dtype=np.float32)
+            
+            # Neighbor lists sorted by prob desc
+            neighbor_lists = []
+            for u in range(N_local):
+                nbrs = [(v, float(prob_matrix[u, v])) for v in range(N_local) if candidate_mask[u, v] and v != u]
+                nbrs.sort(key=lambda t: t[1], reverse=True)
+                neighbor_lists.append(nbrs)
+        except Exception:
+            # Fail-safe fallbacks with empty contracts if anything goes wrong
+            node_positions = np.zeros((0, 2), dtype=np.float32)
+            distance_matrix = np.zeros((0, 0), dtype=np.float32)
+            prob_matrix = np.zeros((0, 0), dtype=np.float32)
+            candidate_mask = np.zeros((0, 0), dtype=bool)
+            neighbor_lists = []
+            undirected_edges = np.zeros((0, 2), dtype=np.int64)
+            undirected_edge_probs = np.zeros((0,), dtype=np.float32)
+            undirected_edge_lengths = np.zeros((0,), dtype=np.float32)
+
         # Use appropriate decoding strategy
         if decoding_strategy == 'greedy':
             tour = greedy_decode(adj_list, num_nodes)

@@ -185,6 +185,13 @@ class TSPAttentionCriterion(nn.Module):
         
         loss_values = torch.zeros(seq_len, batch_size, device=output.device)
         
+        use_node_softmax = False
+        try:
+            import os
+            use_node_softmax = os.environ.get('TSP_USE_NODE_SOFTMAX_LOSS', '0') == '1'
+        except Exception:
+            use_node_softmax = False
+
         for output_pos, batch_infos in pos_batch_map.items():
             
             for batch_idx, (eval_info, targets_pos) in batch_infos.items():
@@ -203,12 +210,21 @@ class TSPAttentionCriterion(nn.Module):
                     if valid_tour_mask.any():
                         valid_tour = target_tour[valid_tour_mask]
                         tour_edges_set = self._create_tour_edges_vectorized(valid_tour)
-                        tour_edges_cache[tour_cache_key] = tour_edges_set
+                        # Also cache forward lists for node-softmax
+                        tour_forward = None
+                        try:
+                            vt = valid_tour.detach().cpu()
+                            # forward mapping: u -> next
+                            next_nodes = torch.cat([vt[1:], vt[0:1]], dim=0)
+                            tour_forward = (vt.tolist(), next_nodes.tolist())
+                        except Exception:
+                            tour_forward = None
+                        tour_edges_cache[tour_cache_key] = (tour_edges_set, tour_forward)
                     else:
-                        tour_edges_cache[tour_cache_key] = set()
+                        tour_edges_cache[tour_cache_key] = (set(), None)
                 
-                tour_edges_set = tour_edges_cache[tour_cache_key]
-                if not tour_edges_set:
+                tour_edges_set, tour_forward = tour_edges_cache[tour_cache_key]
+                if not tour_edges_set and not use_node_softmax:
                     continue
                 
                 num_edges = edge_index.size(1)
@@ -221,47 +237,114 @@ class TSPAttentionCriterion(nn.Module):
                 enhanced_eval_info.update(edge_info_mappings)
                 
                 try:
-                    if enhanced_eval_info.get('coordinate_merging_enabled', False):
-                        edge_labels, edge_weights = self._vectorized_instance_hypergraph_labeling(
-                            edge_index, tour_edges_set, enhanced_eval_info, num_edges, output.device
-                        )
-                    elif enhanced_eval_info.get('is_shared_basis_film', False):
-                        edge_labels, edge_weights = self._vectorized_shared_basis_film_labeling(
-                            edge_index, tour_edges_set, enhanced_eval_info, num_edges, output.device
-                        )
+                    if use_node_softmax and tour_forward is not None:
+                        # Node-wise softmax CE over outgoing and incoming edges
+                        src_global = edge_index[0]
+                        dst_global = edge_index[1]
+                        # Build global->local map
+                        gl_to_loc = {}
+                        if isinstance(valid_indices, torch.Tensor):
+                            for li, gi in enumerate(valid_indices.detach().cpu().tolist()):
+                                gl_to_loc[int(gi)] = li
+                        else:
+                            # Fallback: assume nodes are 0..num_valid_nodes-1 and edge_index uses local
+                            gl_to_loc = None
+                        # Map edges to local indices
+                        if gl_to_loc is not None:
+                            src_local = torch.tensor([gl_to_loc.get(int(g), -1) for g in src_global.detach().cpu().tolist()], device=output.device)
+                            dst_local = torch.tensor([gl_to_loc.get(int(g), -1) for g in dst_global.detach().cpu().tolist()], device=output.device)
+                        else:
+                            src_local = src_global.clone()
+                            dst_local = dst_global.clone()
+                        mask_valid = (src_local >= 0) & (src_local < num_valid_nodes) & (dst_local >= 0) & (dst_local < num_valid_nodes)
+                        logits = edge_predictions[mask_valid]
+                        src_l = src_local[mask_valid]
+                        dst_l = dst_local[mask_valid]
+                        vt_list, next_list = tour_forward
+                        # Build next/prev arrays
+                        next_arr = torch.full((num_valid_nodes,), -1, device=output.device, dtype=torch.long)
+                        prev_arr = torch.full((num_valid_nodes,), -1, device=output.device, dtype=torch.long)
+                        for u, v in zip(vt_list, next_list):
+                            u_i = int(u)
+                            v_i = int(v)
+                            if 0 <= u_i < num_valid_nodes and 0 <= v_i < num_valid_nodes:
+                                next_arr[u_i] = v_i
+                                prev_arr[v_i] = u_i
+                        # Group by source for outgoing
+                        outgoing_loss_sum = 0.0
+                        outgoing_count = 0
+                        if logits.numel() > 0:
+                            unique_src = torch.unique(src_l)
+                            for u in unique_src.tolist():
+                                u_tensor = torch.tensor(u, device=output.device)
+                                idx = (src_l == u_tensor)
+                                if idx.any():
+                                    logit_u = logits[idx]
+                                    dst_u = dst_l[idx]
+                                    target_v = next_arr[u]
+                                    # Find target edge position
+                                    pos_idx = (dst_u == target_v).nonzero(as_tuple=False).view(-1)
+                                    if pos_idx.numel() > 0:
+                                        log_probs = F.log_softmax(logit_u, dim=0)
+                                        outgoing_loss_sum += -log_probs[pos_idx[0]]
+                                        outgoing_count += 1
+                        # Group by destination for incoming
+                        incoming_loss_sum = 0.0
+                        incoming_count = 0
+                        if logits.numel() > 0:
+                            unique_dst = torch.unique(dst_l)
+                            for v in unique_dst.tolist():
+                                v_tensor = torch.tensor(v, device=output.device)
+                                idx = (dst_l == v_tensor)
+                                if idx.any():
+                                    logit_v = logits[idx]
+                                    src_v = src_l[idx]
+                                    target_u = prev_arr[v]
+                                    pos_idx = (src_v == target_u).nonzero(as_tuple=False).view(-1)
+                                    if pos_idx.numel() > 0:
+                                        log_probs = F.log_softmax(logit_v, dim=0)
+                                        incoming_loss_sum += -log_probs[pos_idx[0]]
+                                        incoming_count += 1
+                        denom = max(1, outgoing_count) + max(1, incoming_count)
+                        node_sm_loss = (outgoing_loss_sum / max(1, outgoing_count) + incoming_loss_sum / max(1, incoming_count))
+                        loss_values[output_pos, batch_idx] = node_sm_loss
                     else:
-                        edge_labels, edge_weights = self._vectorized_standard_labeling(
-                            edge_index, tour_edges_set, valid_indices, num_edges, output.device
-                        )
-                    
-                    if edge_labels.numel() > 0:
-                        min_size = min(edge_predictions.size(0), edge_labels.size(0))
-                        if min_size > 0:
-                            pred_subset = edge_predictions[:min_size]
-                            label_subset = edge_labels[:min_size]
-                            weight_subset = edge_weights[:min_size]
-                            
-                            # Debug: per-step pos/neg counts
-                            try:
-                                import os
-                                if os.environ.get('TSP_DEBUG_GUARDS', '0') == '1':
-                                    with torch.no_grad():
-                                        valid_mask = weight_subset > 0
-                                        pos_count = int(((label_subset == 1.0) & valid_mask).sum().item())
-                                        neg_count = int(((label_subset == 0.0) & valid_mask).sum().item())
-                                        total_pred = int(valid_mask.sum().item())
-                                        expected_pos = 2 * int(num_valid_nodes)
-                                        print(f"DEBUG(loss): pos={pos_count} neg={neg_count} total={total_pred} expected_pos~={expected_pos}")
-                            except Exception:
-                                pass
-
-                            bce_loss = F.binary_cross_entropy_with_logits(
-                                pred_subset, label_subset, weight=weight_subset, reduction='sum'
+                        # Default BCE path
+                        if enhanced_eval_info.get('coordinate_merging_enabled', False):
+                            edge_labels, edge_weights = self._vectorized_instance_hypergraph_labeling(
+                                edge_index, tour_edges_set, enhanced_eval_info, num_edges, output.device
                             )
-                            
-                            loss_values[output_pos, batch_idx] = bce_loss/weight_subset.sum()
-                
-                except Exception as e:
+                        elif enhanced_eval_info.get('is_shared_basis_film', False):
+                            edge_labels, edge_weights = self._vectorized_shared_basis_film_labeling(
+                                edge_index, tour_edges_set, enhanced_eval_info, num_edges, output.device
+                            )
+                        else:
+                            edge_labels, edge_weights = self._vectorized_standard_labeling(
+                                edge_index, tour_edges_set, valid_indices, num_edges, output.device
+                            )
+                        if edge_labels.numel() > 0:
+                            min_size = min(edge_predictions.size(0), edge_labels.size(0))
+                            if min_size > 0:
+                                pred_subset = edge_predictions[:min_size]
+                                label_subset = edge_labels[:min_size]
+                                weight_subset = edge_weights[:min_size]
+                                try:
+                                    import os
+                                    if os.environ.get('TSP_DEBUG_GUARDS', '0') == '1':
+                                        with torch.no_grad():
+                                            valid_mask = weight_subset > 0
+                                            pos_count = int(((label_subset == 1.0) & valid_mask).sum().item())
+                                            neg_count = int(((label_subset == 0.0) & valid_mask).sum().item())
+                                            total_pred = int(valid_mask.sum().item())
+                                            expected_pos = 2 * int(num_valid_nodes)
+                                            print(f"DEBUG(loss): pos={pos_count} neg={neg_count} total={total_pred} expected_pos~={expected_pos}")
+                                except Exception:
+                                    pass
+                                bce_loss = F.binary_cross_entropy_with_logits(
+                                    pred_subset, label_subset, weight=weight_subset, reduction='sum'
+                                )
+                                loss_values[output_pos, batch_idx] = bce_loss/weight_subset.sum()
+                except Exception:
                     continue
         
         return loss_tensor + loss_values
