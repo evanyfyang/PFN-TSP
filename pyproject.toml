@@ -16,7 +16,7 @@ description = "PFNs made ready for BO"
 readme = "README.md"
 requires-python = ">=3.9"
 dependencies=[
-        'torch>=2.5',
+        'torch==2.6.0',
         'scikit-learn>=0.24.2',
         'pyyaml>=5.4.1',
         'numpy>=1.21.2',
@@ -25,7 +25,10 @@ dependencies=[
         'configspace>=0.4.21',
         'tqdm>=4.62.1',
         'botorch>=0.7.2',
-        'matplotlib>=3.10.1',
+        'matplotlib>=3.10.1',        
+        'ortools>=9.14.6206',
+        'elkai>=2.0.1',
+        'psutil>=7.0.0'
 ]
 classifiers = [
     "Programming Language :: Python :: 3",

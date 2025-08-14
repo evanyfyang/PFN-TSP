@@ -59,7 +59,7 @@ def solve_tsp_static(coords: np.ndarray) -> list:
         return list(range(num_nodes)), None
 
 
-def solve_tsp_ortools(coords: np.ndarray) -> tuple:
+def solve_tsp_ortools(coords: np.ndarray, time_limit: int = 5) -> tuple:
     """
     Solve TSP using Google OR-Tools with metaheuristic, running for 5 seconds.
     
@@ -103,7 +103,7 @@ def solve_tsp_ortools(coords: np.ndarray) -> tuple:
         routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC)
     search_parameters.local_search_metaheuristic = (
         routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH)
-    search_parameters.time_limit.seconds = 5  # 5 second time limit
+    search_parameters.time_limit.seconds = time_limit  # time limit in second
     
     start_time = time.time()
     # Solve the problem
