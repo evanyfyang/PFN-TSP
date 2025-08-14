@@ -21,6 +21,7 @@ from pfns.priors.tsp_data_loader import TSPDataLoader, solve_tsp_ortools, solve_
 from pfns.priors.tsp_offline_data_loader import TSPOfflineDataLoader
 from pfns.priors.prior import Batch
 from pfns.priors.tsp_decoding_strategies import *
+from pfns.priors.tsp_postprocessing import *
 from pfns.priors.tsp_encoder import tsp_graph_encoder_generator, tsp_tour_encoder_generator
 
 def parse_args():
@@ -44,7 +45,7 @@ def parse_args():
     parser.add_argument('--train', action='store_true', help='Whether to train the model (otherwise just test)')
     parser.add_argument('--model_path', type=str, default=None, help='Path to pretrained model for testing')
     parser.add_argument('--decoding_strategy', type=str, default='greedy', 
-                        choices=['greedy', 'beam_search', 'mcmc', 'greedy_all', 'beam_search_all', 'greedy_edge'], 
+                        choices=['greedy', 'beam_search', 'mcmc', 'greedy_all', 'beam_search_all', 'greedy_edge', 'mcts'], 
                         help='Decoding strategy for TSP')
     parser.add_argument('--test_instances', type=int, default=20, help='Number of test instances')
     parser.add_argument('--use_complete_graph', action='store_true', default=False, 
@@ -495,6 +496,8 @@ def predict_tsp_with_pfn(model, coords, solution, candidate_info=None, use_compl
             tour = beam_search_all_decode(adj_list, num_nodes)
         elif decoding_strategy == 'mcmc':
             tour = mcmc_decode(adj_list, node_map, edge_index_np, edge_values_np, num_nodes)
+        elif decoding_strategy == 'mcts':
+            tour = mcts_decode(node_positions, distance_matrix, candidate_mask, prob_matrix, neighbor_lists)
         elif decoding_strategy == 'greedy_edge':
             tour = greedy_edge_decode(adj_list, num_nodes)
         else:
@@ -967,9 +970,13 @@ def evaluate_and_compare(model, test_instances, lkh_solutions, candidate_infos, 
     pfn_distances = []
     ortools_distances = []
     lkh3_distances = []
+    pfn_2opt_distances = []
+    pfn_or_distances = []
     processing_times_pfn = []
     processing_times_ortools = []
     processing_times_lkh3 = []
+    processing_times_pfn_kopt = []
+    processing_times_pfn_or = []
     
     viz_idx = np.random.randint(0, len(test_instances))
     
@@ -982,7 +989,7 @@ def evaluate_and_compare(model, test_instances, lkh_solutions, candidate_infos, 
         # Step 1: Compute OR-Tools solution and record time
         print(f"  Computing OR-Tools solution for instance with {len(last_coords)} nodes...")
         start_time = time.time()
-        ortools_result = solve_tsp_ortools(last_coords)
+        ortools_result = solve_tsp_ortools(last_coords, time_limit = 5)
         
         # Handle different return formats from solve_tsp_ortools
         if isinstance(ortools_result, tuple) and len(ortools_result) == 2:
@@ -1024,18 +1031,29 @@ def evaluate_and_compare(model, test_instances, lkh_solutions, candidate_infos, 
             loss_direction_mode=loss_direction_mode
         )
         pfn_time = time.time() - start_time
+        pfn_kopt_tour = solve_tsp_static_with_2opt_and_initial_solutions(initial_solution = pfn_tour, coords = last_coords, time_limit = 1)
+        pfn_2opt_time = time.time() - start_time
+        start_time = time.time()
+        pfn_or_tour = solve_tsp_static_with_or_tools_and_initial_solutions(initial_solution = pfn_tour, coords = last_coords, time_limit = 1)
+        pfn_or_time = pfn_time + time.time() - start_time
         pfn_distances.append(pfn_distance)
         processing_times_pfn.append(pfn_time)
+        pfn_2opt_distance = calculate_tour_length(last_coords, pfn_kopt_tour)
+        pfn_2opt_distances.append(pfn_2opt_distance)
+        pfn_or_distance = calculate_tour_length(last_coords, pfn_or_tour)
+        pfn_or_distances.append(pfn_or_distance)
         
         # Step 3: Report comparison results
-        print(f"  Results: PFN distance={pfn_distance:.4f}, OR-Tools distance={ortools_distance:.4f}, LKH3 distance={lkh3_distance:.4f}")
-        print(f"  Times: PFN={pfn_time:.4f}s, OR-Tools={ortools_solve_time:.4f}s, LKH3={lkh3_time:.4f}s")
+        print(f"  Results: PFN distance={pfn_distance:.4f}, OR-Tools distance={ortools_distance:.4f}, LKH3 distance={lkh3_distance:.4f}, PFN + 2opt distance={pfn_2opt_distance:.4f}, PFN + OR-Tools distance={pfn_or_distance:.4f}")
+        print(f"  Times: PFN={pfn_time:.4f}s, OR-Tools={ortools_solve_time:.4f}s, LKH3={lkh3_time:.4f}s, PFN + 2-opt={pfn_2opt_time:.4f}s, PFN + OR={pfn_or_time:.4f}s")
         
         # Save visualization for one random instance
         if i == viz_idx and save_plot:
-            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 8))
+            fig, ((ax1, ax2), (ax3,ax4)) = plt.subplots(2, 2, figsize=(24, 24))
             plot_tour(last_coords, pfn_tour, f"PFN Tour ({decoding_strategy}, distance: {pfn_distance:.4f})", ax=ax1)
             plot_tour(last_coords, ortools_tour, f"OR-Tools Tour (distance: {ortools_distance:.4f})", ax=ax2)
+            plot_tour(last_coords, pfn_kopt_tour, f"PFN + 2-opt Tour ({decoding_strategy}, distance: {ortools_distance:.4f})", ax=ax3)
+            plot_tour(last_coords, pfn_or_tour, f"PFN + OR-Tools Tour ({decoding_strategy}, distances: {pfn_or_distance:.4f})", ax = ax4)
             plt.tight_layout()
             plt.savefig(plot_path)
             plt.close()
@@ -1044,13 +1062,19 @@ def evaluate_and_compare(model, test_instances, lkh_solutions, candidate_infos, 
     # Compute final statistics
     pfn_distances = np.array(pfn_distances)
     ortools_distances = np.array(ortools_distances)
-    relative_gap_vs_ortools = (pfn_distances - ortools_distances) / ortools_distances * 100
-    relative_gap_vs_lkh3 = (pfn_distances - lkh3_distances) / lkh3_distances * 100
+    pfn_2opt_distances = np.array(pfn_2opt_distances)
+    pfn_or_distances = np.array(pfn_or_distances)
+    relative_gap_pfn_vs_ortools = (pfn_distances - ortools_distances) / ortools_distances * 100
+    relative_gap_pfn_vs_lkh3 = (pfn_distances - lkh3_distances) / lkh3_distances * 100
+    relative_gap_pfn_2opt_vs_ortools = (pfn_2opt_distances - ortools_distances) / ortools_distances * 100
+    relative_gap_pfn_2opt_vs_lkh3 = (pfn_2opt_distances - lkh3_distances) / lkh3_distances * 100
+    relative_gap_pfn_or_vs_ortools = (pfn_or_distances - ortools_distances) / ortools_distances * 100
+    relative_gap_pfn_or_vs_lkh3 = (pfn_or_distances - lkh3_distances) / lkh3_distances * 100
     ortools_vs_lkh3_gap = (ortools_distances - lkh3_distances) / lkh3_distances * 100
     
     print("\n===== Evaluation Results =====")
-    print(f"Average path length: PFN={np.mean(pfn_distances):.4f}, OR-Tools={np.mean(ortools_distances):.4f}, LKH3={np.mean(lkh3_distances):.4f}")
-    print(f"PFN vs OR-Tools avg gap: {np.mean(relative_gap_vs_ortools):.2f}%, PFN vs LKH3 avg gap: {np.mean(relative_gap_vs_lkh3):.2f}%")
+    print(f"Average path length: PFN={np.mean(pfn_distances):.4f}, OR-Tools={np.mean(ortools_distances):.4f}, LKH3={np.mean(lkh3_distances):.4f}, PFN+2opt={np.mean(pfn_2opt_distances):.4f}, PFN+OR={np.mean(pfn_or_distances):.4f}")
+    print(f"PFN vs OR-Tools avg gap: {np.mean(relative_gap_pfn_vs_ortools):.2f}%, PFN vs LKH3 avg gap: {np.mean(relative_gap_pfn_vs_lkh3):.2f}%, PFN-2opt vs OR-Tools avg gap: {np.mean(relative_gap_pfn_2opt_vs_ortools):.2f}%, PFN-2opt vs LKH3 avg gap: {np.mean(relative_gap_pfn_2opt_vs_lkh3):.2f}%, PFN-OR vs OR-Tools avg gap: {np.mean(relative_gap_pfn_or_vs_ortools):.2f}%, PFN-OR vs LKH3 avg gap: {np.mean(relative_gap_pfn_or_vs_lkh3):.2f}%")
     print(f"OR-Tools vs LKH3 avg gap: {np.mean(ortools_vs_lkh3_gap):.2f}%")
     print(f"PFN win rate vs OR-Tools: {np.mean(pfn_distances <= ortools_distances) * 100:.2f}% | vs LKH3: {np.mean(pfn_distances <= lkh3_distances) * 100:.2f}%")
     print(f"Avg time (s): PFN={np.mean(processing_times_pfn):.4f}, OR-Tools={np.mean(processing_times_ortools):.4f}, LKH3={np.mean(processing_times_lkh3):.4f}")
@@ -1060,8 +1084,8 @@ def evaluate_and_compare(model, test_instances, lkh_solutions, candidate_infos, 
         'pfn_distances': pfn_distances,
         'ortools_distances': ortools_distances,
         'lkh3_distances': lkh3_distances,
-        'relative_gap_vs_ortools': relative_gap_vs_ortools,
-        'relative_gap_vs_lkh3': relative_gap_vs_lkh3,
+        'relative_gap_vs_ortools': relative_gap_pfn_vs_ortools,
+        'relative_gap_vs_lkh3': relative_gap_pfn_vs_lkh3,
         'ortools_vs_lkh3_gap': ortools_vs_lkh3_gap,
         'pfn_times': processing_times_pfn,
         'ortools_times': processing_times_ortools,
