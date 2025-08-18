@@ -163,6 +163,7 @@ cython_debug/
 #.idea/
 
 saved_models/
+output_log/
 torch_sampling/
 models_diff/
 *.out

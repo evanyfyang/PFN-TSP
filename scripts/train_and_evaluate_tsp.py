@@ -45,7 +45,7 @@ def parse_args():
     parser.add_argument('--train', action='store_true', help='Whether to train the model (otherwise just test)')
     parser.add_argument('--model_path', type=str, default=None, help='Path to pretrained model for testing')
     parser.add_argument('--decoding_strategy', type=str, default='greedy', 
-                        choices=['greedy', 'beam_search', 'mcmc', 'greedy_all', 'beam_search_all', 'greedy_edge', 'mcts'], 
+                        choices=['greedy', 'beam_search', 'mcmc', 'greedy_all', 'beam_search_all', 'greedy_edge', 'mcts', 'sampling', 'sampling_all'], 
                         help='Decoding strategy for TSP')
     parser.add_argument('--test_instances', type=int, default=20, help='Number of test instances')
     parser.add_argument('--use_complete_graph', action='store_true', default=False, 
@@ -496,6 +496,10 @@ def predict_tsp_with_pfn(model, coords, solution, candidate_info=None, use_compl
             tour = beam_search_all_decode(adj_list, num_nodes)
         elif decoding_strategy == 'mcmc':
             tour = mcmc_decode(adj_list, node_map, edge_index_np, edge_values_np, num_nodes)
+        elif decoding_strategy == 'sampling':
+            tour = sampling_decode(adj_list, num_nodes)
+        elif decoding_strategy == 'sampling_all':
+            tour = sampling_all_decode(adj_list, num_nodes)
         elif decoding_strategy == 'mcts':
             tour = mcts_decode(node_positions, distance_matrix, candidate_mask, prob_matrix, neighbor_lists)
         elif decoding_strategy == 'greedy_edge':
@@ -570,7 +574,7 @@ def plot_tour(coords, tour, title, ax=None):
     for i, (x, y) in enumerate(coords):
         ax.text(x, y, str(i), fontsize=12)
     
-    ax.set_title(title)
+    ax.set_title(title, fontsize=16)
     ax.set_xlabel('X')
     ax.set_ylabel('Y')
     
@@ -989,7 +993,7 @@ def evaluate_and_compare(model, test_instances, lkh_solutions, candidate_infos, 
         # Step 1: Compute OR-Tools solution and record time
         print(f"  Computing OR-Tools solution for instance with {len(last_coords)} nodes...")
         start_time = time.time()
-        ortools_result = solve_tsp_ortools(last_coords, time_limit = 5)
+        ortools_result = solve_tsp_ortools(last_coords, time_limit = 10)
         
         # Handle different return formats from solve_tsp_ortools
         if isinstance(ortools_result, tuple) and len(ortools_result) == 2:
@@ -1031,10 +1035,11 @@ def evaluate_and_compare(model, test_instances, lkh_solutions, candidate_infos, 
             loss_direction_mode=loss_direction_mode
         )
         pfn_time = time.time() - start_time
-        pfn_kopt_tour = solve_tsp_static_with_2opt_and_initial_solutions(initial_solution = pfn_tour, coords = last_coords, time_limit = 1)
-        pfn_2opt_time = time.time() - start_time
         start_time = time.time()
-        pfn_or_tour = solve_tsp_static_with_or_tools_and_initial_solutions(initial_solution = pfn_tour, coords = last_coords, time_limit = 1)
+        pfn_kopt_tour = solve_tsp_static_with_2opt_and_initial_solutions(initial_solution = pfn_tour, coords = last_coords, time_limit = 5)
+        pfn_2opt_time = pfn_time + time.time() - start_time
+        start_time = time.time()
+        pfn_or_tour = solve_tsp_static_with_or_tools_and_initial_solutions(initial_solution = pfn_tour, coords = last_coords, time_limit = 5)
         pfn_or_time = pfn_time + time.time() - start_time
         pfn_distances.append(pfn_distance)
         processing_times_pfn.append(pfn_time)
@@ -1049,11 +1054,11 @@ def evaluate_and_compare(model, test_instances, lkh_solutions, candidate_infos, 
         
         # Save visualization for one random instance
         if i == viz_idx and save_plot:
-            fig, ((ax1, ax2), (ax3,ax4)) = plt.subplots(2, 2, figsize=(24, 24))
-            plot_tour(last_coords, pfn_tour, f"PFN Tour ({decoding_strategy}, distance: {pfn_distance:.4f})", ax=ax1)
-            plot_tour(last_coords, ortools_tour, f"OR-Tools Tour (distance: {ortools_distance:.4f})", ax=ax2)
-            plot_tour(last_coords, pfn_kopt_tour, f"PFN + 2-opt Tour ({decoding_strategy}, distance: {ortools_distance:.4f})", ax=ax3)
-            plot_tour(last_coords, pfn_or_tour, f"PFN + OR-Tools Tour ({decoding_strategy}, distances: {pfn_or_distance:.4f})", ax = ax4)
+            fig, ((ax1, ax2), (ax3,ax4)) = plt.subplots(2, 2, figsize=(24, 8))
+            plot_tour(last_coords, pfn_tour, f"PFN Tour ({decoding_strategy}, distance: {pfn_distance:.4f}, time: {pfn_time:.4f}s, gap: {(pfn_distance - ortools_distance)/ortools_distance*100.0:.4f}%)", ax=ax1)
+            plot_tour(last_coords, ortools_tour, f"OR-Tools Tour (distance: {ortools_distance:.4f}, time: {ortools_solve_time:.4f}s, gap: {(ortools_distance- ortools_distance)/ortools_distance*100.0:.4f}%)", ax=ax2)
+            plot_tour(last_coords, pfn_kopt_tour, f"PFN + 2-opt Tour ({decoding_strategy}, distance: {pfn_2opt_distance:.4f}, time: {pfn_2opt_time:.4f}s, gap: {(pfn_2opt_distance- ortools_distance)/ortools_distance*100.0:.4f}%)", ax=ax3)
+            plot_tour(last_coords, pfn_or_tour, f"PFN + OR-Tools Tour ({decoding_strategy}, distances: {pfn_or_distance:.4f}, time: {pfn_or_time:.4f}s, gap: {(pfn_or_distance - ortools_distance)/ortools_distance*100.0:.4f}%)", ax = ax4)
             plt.tight_layout()
             plt.savefig(plot_path)
             plt.close()

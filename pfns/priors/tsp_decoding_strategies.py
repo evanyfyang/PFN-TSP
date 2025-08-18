@@ -374,7 +374,133 @@ def mcmc_decode(adj_list, node_map, edge_index, edge_values, num_nodes, num_iter
     return best_tour 
 
 
+def sampling_decode(adj_list, num_nodes, *, seed=0):
+    """
+    Sampling-based decoding starting from node 0, using the provided neighbor probabilities.
 
+    Args:
+        adj_list: list where adj_list[i] is [(neighbor, prob_in_[0,1]), ...]
+        num_nodes: total number of nodes
+        seed: optional int for reproducibility
+
+    Returns:
+        tour: list of node indices in visiting order
+    """
+    rng = random.Random(seed)
+
+    current_node = 0
+    tour = [current_node]
+    visited = set([current_node])
+
+    while len(tour) < num_nodes:
+        neighbors = adj_list[current_node]
+        valid = [(n, p) for n, p in neighbors if n not in visited]
+
+        if not valid:
+            # No unvisited neighbors from current node: sample uniformly from remaining nodes
+            unvisited = [n for n in range(num_nodes) if n not in visited]
+            if not unvisited:
+                break
+            next_node = rng.choice(unvisited)
+        else:
+            nodes, probs = zip(*valid)
+
+            # Normalize (in case they don't already sum to 1 over the unvisited set)
+            total = sum(p for p in probs if p > 0)
+            if total > 0:
+                weights = [max(p, 0.0) / total for p in probs]
+            else:
+                # All zero or negative: fall back to uniform over valid neighbors
+                weights = [1.0 / len(nodes)] * len(nodes)
+
+            # Categorical draw
+            r = rng.random()
+            cum = 0.0
+            next_node = nodes[-1]
+
+            #can use choice instead
+            for n, w in zip(nodes, weights):
+                cum += w
+                if r <= cum:
+                    next_node = n
+                    break
+
+        tour.append(next_node)
+        visited.add(next_node)
+        current_node = next_node
+
+    return tour
+
+def sampling_all_decode(adj_list, num_nodes, *, seed=0):
+    """
+    Try sampling-based decoding starting from each node and select the best path. Sampling strategy similar to sampling_decode
+    Uses neighbor probabilities directly for sampling.
+    """
+    rng = random.Random(seed)
+    best_tour = None
+    best_tour_prob = -float('inf')
+
+    for start_node in range(num_nodes):
+        current_node = start_node
+        tour = [current_node]
+        visited = {current_node}
+        tour_prob = 0.0
+
+        while len(tour) < num_nodes:
+            neighbors = adj_list[current_node]
+            valid_neighbors = [(node, prob) for node, prob in neighbors if node not in visited]
+
+            if not valid_neighbors:
+                # No unvisited neighbors: pick uniformly from remaining
+                unvisited = [n for n in range(num_nodes) if n not in visited]
+                if not unvisited:
+                    break
+                next_node = rng.choice(unvisited)
+                prob = 0.0  # penalty
+            else:
+                nodes, probs = zip(*valid_neighbors)
+                total = sum(p for p in probs if p > 0)
+                if total > 0:
+                    weights = [max(p, 0.0) / total for p in probs]
+                else:
+                    # If all probabilities are 0, fallback to uniform
+                    weights = [1.0 / len(nodes)] * len(nodes)
+
+                # categorical draw
+                r = rng.random()
+                cum = 0.0
+                next_node = nodes[-1]
+                prob = 0.0
+                for n, w, p in zip(nodes, weights, probs):
+                    cum += w
+                    if r <= cum:
+                        next_node = n
+                        prob = p
+                        break
+
+            tour.append(next_node)
+            visited.add(next_node)
+            current_node = next_node
+            tour_prob += prob
+
+        # Add edge back to start
+        if len(tour) == num_nodes:
+            last_node = tour[-1]
+            first_node = tour[0]
+            for node, prob in adj_list[last_node]:
+                if node == first_node:
+                    tour_prob += prob
+                    break
+
+            if tour_prob > best_tour_prob:
+                best_tour_prob = tour_prob
+                best_tour = tour
+
+    # Fallback if nothing worked
+    if best_tour is None:
+        best_tour = sampling_decode(adj_list, num_nodes, seed=seed)
+
+    return best_tour
 
 def mcts_decode(
     node_positions: np.ndarray,
@@ -411,7 +537,7 @@ def mcts_decode(
 
     Alpha = 0.85
     Beta = 1.0
-    Param_T = 0.02
+    Param_T = 0.2
     Param_H = 3
     Max_Depth = min(16, N)
 
