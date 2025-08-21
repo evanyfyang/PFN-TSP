@@ -993,7 +993,7 @@ def evaluate_and_compare(model, test_instances, lkh_solutions, candidate_infos, 
         # Step 1: Compute OR-Tools solution and record time
         print(f"  Computing OR-Tools solution for instance with {len(last_coords)} nodes...")
         start_time = time.time()
-        ortools_result = solve_tsp_ortools(last_coords, time_limit = 10)
+        ortools_result = solve_tsp_ortools(last_coords, time_limit = 5)
         
         # Handle different return formats from solve_tsp_ortools
         if isinstance(ortools_result, tuple) and len(ortools_result) == 2:
@@ -1036,10 +1036,10 @@ def evaluate_and_compare(model, test_instances, lkh_solutions, candidate_infos, 
         )
         pfn_time = time.time() - start_time
         start_time = time.time()
-        pfn_kopt_tour = solve_tsp_static_with_2opt_and_initial_solutions(initial_solution = pfn_tour, coords = last_coords, time_limit = 5)
+        pfn_kopt_tour = solve_tsp_static_with_2opt_and_initial_solutions(initial_solution = pfn_tour, coords = last_coords, time_limit = 1)
         pfn_2opt_time = pfn_time + time.time() - start_time
         start_time = time.time()
-        pfn_or_tour = solve_tsp_static_with_or_tools_and_initial_solutions(initial_solution = pfn_tour, coords = last_coords, time_limit = 5)
+        pfn_or_tour = solve_tsp_static_with_or_tools_and_initial_solutions(initial_solution = pfn_tour, coords = last_coords, time_limit = 1)
         pfn_or_time = pfn_time + time.time() - start_time
         pfn_distances.append(pfn_distance)
         processing_times_pfn.append(pfn_time)
